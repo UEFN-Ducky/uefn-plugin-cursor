@@ -34,6 +34,8 @@ def build_zip(*, out: Path | None = None) -> Path:
                 continue
             if path.suffix.lower() in SKIP_SUFFIX or path.name.startswith("."):
                 continue
+            if path.name.startswith("test_"):
+                continue
             zf.write(path, arcname="/".join(rel_parts))
     print(f"wrote {dest} ({dest.stat().st_size} bytes)")
     return dest

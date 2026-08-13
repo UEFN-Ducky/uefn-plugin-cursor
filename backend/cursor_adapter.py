@@ -27,6 +27,7 @@ from backend.agent.coding_agents.cli_pty import run_cli_in_terminal
 from backend.agent.coding_agents.mcp_inject import coding_agents_tmp_dir
 from backend.agent.coding_agents.proc_exec import run_streaming_process
 from backend.agent.coding_agents.settings_helpers import coding_agent_cfg
+from .cursor_tool_unwrap import unwrap_cursor_tool
 
 # #region agent log
 def _dbg_tool_pairing(message: str, data: dict[str, Any]) -> None:
@@ -64,24 +65,34 @@ function parseArgsBlob(a) {
   return a && typeof a === "object" ? a : {};
 }
 
-/** Cursor wraps MCP as CallMcpTool — unwrap so Ducky tool cards see the real name. */
+/**
+ * Cursor onDelta ToolCall is a discriminated union
+ * `{ type: "read"|"edit"|"mcp"|…, args }`, not `{ name }`.
+ * MCP nests the real tool as args.toolName + args.args.
+ * Missing that made every card show the fallback label "tool".
+ */
 function unwrapMcpTool(name, args) {
   const n = String(name || "").trim() || "tool";
-  const a = args && typeof args === "object" ? args : {};
-  if (n !== "CallMcpTool" && n !== "call_mcp_tool") return { name: n, args: a };
+  const a = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const wrap =
+    n === "CallMcpTool" || n === "call_mcp_tool" || n === "mcp" || n === "tool";
+  if (!wrap) return { name: n, args: a };
   const inner = String(a.toolName || a.tool_name || "").trim();
   if (!inner) return { name: n, args: a };
   return { name: inner, args: parseArgsBlob(a.args ?? a.arguments) };
 }
 
-function toolName(tc) {
+function toolCallNameRaw(tc) {
   if (!tc || typeof tc !== "object") return "tool";
-  let name = "tool";
-  if (typeof tc.name === "string" && tc.name) name = tc.name;
-  else if (typeof tc.toolName === "string" && tc.toolName) name = tc.toolName;
-  else if (typeof tc.tool === "string" && tc.tool) name = tc.tool;
-  else if (tc.function && typeof tc.function.name === "string") name = tc.function.name;
-  return unwrapMcpTool(name, toolArgsRaw(tc)).name;
+  if (typeof tc.name === "string" && tc.name && tc.name !== "tool") return tc.name;
+  if (typeof tc.toolName === "string" && tc.toolName) return tc.toolName;
+  const t = typeof tc.type === "string" ? tc.type : "";
+  if (t && t !== "tool_call" && t !== "toolCall") return t;
+  if (typeof tc.tool === "string" && tc.tool) return tc.tool;
+  if (tc.function && typeof tc.function.name === "string" && tc.function.name) {
+    return tc.function.name;
+  }
+  return "tool";
 }
 
 function toolArgsRaw(tc) {
@@ -91,14 +102,16 @@ function toolArgsRaw(tc) {
   return parseArgsBlob(a);
 }
 
+function unwrapToolCall(tc) {
+  return unwrapMcpTool(toolCallNameRaw(tc), toolArgsRaw(tc));
+}
+
+function toolName(tc) {
+  return unwrapToolCall(tc).name;
+}
+
 function toolArgs(tc) {
-  if (!tc || typeof tc !== "object") return {};
-  let name = "tool";
-  if (typeof tc.name === "string" && tc.name) name = tc.name;
-  else if (typeof tc.toolName === "string" && tc.toolName) name = tc.toolName;
-  else if (typeof tc.tool === "string" && tc.tool) name = tc.tool;
-  else if (tc.function && typeof tc.function.name === "string") name = tc.function.name;
-  return unwrapMcpTool(name, toolArgsRaw(tc)).args;
+  return unwrapToolCall(tc).args;
 }
 
 function toolResultText(tc) {
@@ -190,10 +203,10 @@ async function main() {
       const t = String(update.text);
       thinkingLen += t.length;
       emit({ type: "thinking", text: t });
-    } else if (utype === "tool-call-started") {
+    } else if (utype === "tool-call-started" || utype === "partial-tool-call") {
       const tc = update.toolCall;
       const callId = String(update.callId || "");
-      if (callId) seenToolStarts.add(callId);
+      if (utype === "tool-call-started" && callId) seenToolStarts.add(callId);
       emit({
         type: "tool_call",
         call_id: callId,
@@ -208,7 +221,10 @@ async function main() {
       const failed =
         tc &&
         typeof tc === "object" &&
-        (tc.status === "error" || tc.error || tc.failed);
+        (tc.status === "error" ||
+          tc.error ||
+          tc.failed ||
+          (tc.result && typeof tc.result === "object" && tc.result.status === "error"));
       emit({
         type: "tool_call",
         call_id: callId,
@@ -621,6 +637,7 @@ class _CursorStreamState:
         status = str(data.get("status") or "")
         name = str(data.get("name") or "tool")
         args = data.get("args") if isinstance(data.get("args"), dict) else {}
+        name, args = unwrap_cursor_tool(name, args)
         # #region agent log
         if name == "tool":
             _dbg_tool_pairing("cursor emitted generic tool metadata", {
@@ -637,7 +654,7 @@ class _CursorStreamState:
                 if args:
                     old_args = prev.get("arguments") if isinstance(prev.get("arguments"), dict) else {}
                     prev["arguments"] = {**old_args, **args}
-                if name and name != "tool":
+                if name and name not in ("tool", "mcp"):
                     prev["name"] = name
                 return
             self._tools[tid] = {
@@ -681,7 +698,7 @@ class _CursorStreamState:
                 if args:
                     old_args = prev.get("arguments") if isinstance(prev.get("arguments"), dict) else {}
                     prev["arguments"] = {**old_args, **args}
-                if name and name != "tool":
+                if name and name not in ("tool", "mcp"):
                     prev["name"] = name
             self._resolve_tool(
                 tid,

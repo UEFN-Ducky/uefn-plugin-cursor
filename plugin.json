@@ -1,9 +1,9 @@
 {
   "id": "cursor",
   "kind": "plugin",
-  "version": "1.0.16",
+  "version": "1.0.19",
   "label": "Cursor",
-  "description": "Cursor API key + Cursor coding agent for Settings \u2192 LLMs. Install from Store \u2192 Gateways, then enable to show Cursor under Providers.",
+  "description": "Cursor API key + Cursor coding agent for Settings → LLMs. Install from Store → Gateways, then enable to show Cursor under Providers.",
   "min_app_version": "1.0.523",
   "default_enabled": true,
   "secret_keys": [
@@ -41,7 +41,7 @@
         {
           "target": "settings.llms.section.llms",
           "title": "Providers & Keys",
-          "body": "Cursor lives under Settings \u2192 LLMs. Open Providers & Keys to paste your API key and enable the Cursor coding agent.",
+          "body": "Cursor lives under Settings → LLMs. Open Providers & Keys to paste your API key and enable the Cursor coding agent.",
           "advance": "require_click",
           "mode": "rect"
         }
