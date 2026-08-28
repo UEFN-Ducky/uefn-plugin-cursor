@@ -16,3 +16,7 @@ Writes `deploy/cursor-1.0.15.ducky-plugin.zip` (scripts/ and deploy/ are not pac
 ## Secrets
 
 Never commit tokens or keys. The app stores `cursor` locally (DPAPI), not in this package.
+
+## License
+
+MIT. Copyright (c) 2026 Mindful Path Company, LLC. See [LICENSE](LICENSE).
