@@ -1,9 +1,8 @@
 """Cursor coding-agent adapter — @cursor/sdk streaming + session resume.
 
 Uses ``Agent.create`` / ``Agent.resume`` + ``agent.send`` with ``onDelta`` and
-``run.stream()`` so thinking, tool calls, and text deltas push live into the
-panel (same event contract as Claude Code). The upstream ``agentId`` is
-persisted as ``upstream_session_id`` so follow-ups resume the same agent.
+``run.stream()``. Resume is this plugin's job (not UEFN-Ducky core). Core
+only stores the upstream ``agentId`` and passes it back on the next turn.
 """
 
 from __future__ import annotations
