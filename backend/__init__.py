@@ -87,11 +87,11 @@ def _fetch_models(api_key: str, **_kw: Any) -> Any:
         if live:
             _write_models_cache(live)
         else:
-            # Keep UI responsive — serve cache/fallback while SDK refresh runs.
+            # Keep UI responsive — serve cache while SDK refresh runs.
             _refresh_models_async(key)
 
     out: list[ModelInfo] = []
-    for row in _known_models():
+    for row in _known_models(key):
         mid = str(row.get("id") or "").strip()
         if not mid:
             continue

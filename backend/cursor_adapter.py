@@ -856,13 +856,6 @@ def _run_sdk_runner(cfg: dict[str, Any], *, api_key: str, timeout_s: float) -> s
                 pass
 
 
-# Last-resort list when the live fetch has never succeeded. Only ids known
-# valid from the SDK docs — the real list always comes from Cursor.models.list.
-_FALLBACK_MODELS: list[dict[str, Any]] = [
-    {"id": "auto", "name": "Auto", "provider": "Cursor"},
-    {"id": "composer-2.5", "name": "composer-2.5", "provider": "Cursor"},
-]
-
 _MODELS_TTL_S = 6 * 60 * 60
 _models_refresh_lock = threading.Lock()
 _models_refresh_inflight = False
@@ -965,11 +958,19 @@ def _refresh_models_async(api_key: str) -> None:
     threading.Thread(target=work, name="cursor-models-refresh", daemon=True).start()
 
 
-def _known_models() -> list[dict[str, Any]]:
-    models = _read_models_cache(allow_stale=True) or list(_FALLBACK_MODELS)
-    if not any(str(row.get("id") or "").strip().lower() == "auto" for row in models):
-        models = [{"id": "auto", "name": "Auto", "provider": "Cursor"}, *models]
-    return models
+def _known_models(api_key: str = "") -> list[dict[str, Any]]:
+    cached = _read_models_cache(allow_stale=True)
+    if cached:
+        if api_key:
+            _refresh_models_async(api_key)
+        return cached
+    if not api_key:
+        return []
+    live = _fetch_models_via_sdk(api_key)
+    if live:
+        _write_models_cache(live)
+        return live
+    return []
 
 
 class CursorAdapter:
@@ -1013,11 +1014,7 @@ class CursorAdapter:
                 "Optional fallback: install cursor-agent CLI."
             )
             available = False
-        # Live model list from Cursor.models.list, cached on disk. A stale
-        # cache still renders (real ids beat the fallback) while a background
-        # refresh updates it for the next dropdown open.
-        if has_cursor_key and enabled and _read_models_cache() is None:
-            _refresh_models_async(get_key("cursor") or "")
+        key = (get_key("cursor") or "") if has_cursor_key else ""
         return CodingAgentInfo(
             id=self.id,
             label=self.label,
@@ -1027,7 +1024,7 @@ class CursorAdapter:
             cli_path=path or override,
             default_args=default_args,
             capabilities=self.capabilities,
-            models=_known_models(),
+            models=_known_models(key),
         )
 
     def _try_node_sdk(
