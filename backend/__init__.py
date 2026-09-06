@@ -7,7 +7,7 @@ from typing import Any
 
 _INSTALL_HELP = (
     "Needs the Cursor API key above (from cursor.com/dashboard/integrations — not your Cursor IDE sign-in). "
-    "Node.js must be on PATH (Ducky installs @cursor/sdk automatically). Optional fallback: cursor-agent CLI."
+    "Node.js must be on PATH. Ducky installs and updates @cursor/sdk when this plugin updates."
 )
 
 
@@ -153,4 +153,10 @@ def register(api) -> None:
         login_status_ok="api key saved",
     )
     api.register_ide_hookup("cursor", label="Cursor")
+    try:
+        from .cli_update import schedule_cli_update_on_plugin_load
+
+        schedule_cli_update_on_plugin_load()
+    except Exception:
+        pass
     api.log("Cursor gateway contribution active (Providers + Coding Agents + IDE + Models)")

@@ -1000,9 +1000,14 @@ class CursorAdapter:
             status = "Disabled — turn on to use in chat"
             available = False
         elif has_cursor_key:
+            from .cli_update import status_text
+
             status = "API key saved"
+            extra = status_text()
             if path:
                 status += f" · CLI: {path}"
+            if extra and extra not in status:
+                status += f" · {extra}"
             available = True
         elif path:
             status = f"CLI found (no API key): {path}"
