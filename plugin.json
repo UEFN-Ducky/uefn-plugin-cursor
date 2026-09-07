@@ -1,7 +1,7 @@
 {
   "id": "cursor",
   "kind": "plugin",
-  "version": "1.0.22",
+  "version": "1.0.23",
   "label": "Cursor",
   "description": "Cursor API key + Cursor coding agent for Settings → LLMs. Install from Store → Gateways, then enable to show Cursor under Providers.",
   "min_app_version": "1.0.523",
@@ -39,10 +39,31 @@
       "settings_tab": "LLMs",
       "steps": [
         {
-          "target": "settings.llms.section.llms",
-          "title": "Providers & Keys",
-          "body": "Cursor lives under Settings → LLMs. Open Providers & Keys to paste your API key and enable the Cursor coding agent.",
+          "target": "settings.llms.provider.cursor",
+          "title": "Open Cursor",
+          "body": "Press the Cursor row in this table. The page slides open so you can paste a key or use the Cursor coding agent.",
           "advance": "require_click",
+          "mode": "rect"
+        },
+        {
+          "target": "settings.llms.provider.key",
+          "title": "API key or Cursor agent",
+          "body": "Paste your Cursor API key here to use Cursor models in Ducky chats. No key? Skip this and use the Cursor coding agent on this same slide.",
+          "advance": "next",
+          "mode": "rect"
+        },
+        {
+          "target": "settings.llms.provider.save",
+          "title": "Test & Save",
+          "body": "Press Test & Save after you paste a key. Using the Cursor agent without a key? Press Skip.",
+          "advance": "require_click",
+          "mode": "rect"
+        },
+        {
+          "target": "settings.llms.provider.agent",
+          "title": "Cursor agent",
+          "body": "This is the Cursor coding agent. Detect finds the CLI. Keep it on to pick Cursor in chat.",
+          "advance": "next",
           "mode": "rect"
         }
       ]
