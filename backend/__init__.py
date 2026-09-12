@@ -77,13 +77,18 @@ def _fetch_models(api_key: str, **_kw: Any) -> Any:
     from .cursor_adapter import (
         _fetch_models_via_sdk,
         _known_models,
+        _read_models_cache,
         _refresh_models_async,
         _write_models_cache,
     )
     from .cursor_effort import row_supports_thinking_effort
 
     key = (api_key or "").strip()
-    if key:
+    # Only go to the SDK when the cached catalog is missing or past its TTL.
+    # This used to run _fetch_models_via_sdk on every call, and every one of
+    # those is a `node runner.mjs` process — so opening the model picker, or
+    # anything else that refreshed the catalog, spawned Node each time.
+    if key and _read_models_cache() is None:
         live = _fetch_models_via_sdk(key)
         if live:
             _write_models_cache(live)

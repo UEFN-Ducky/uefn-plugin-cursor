@@ -976,7 +976,15 @@ def _refresh_models_async(api_key: str) -> None:
 def _known_models(api_key: str = "") -> list[dict[str, Any]]:
     cached = _read_models_cache(allow_stale=True)
     if cached:
-        if api_key:
+        # Refresh only once the rows have actually aged out. This used to fire on
+        # every call, and detect() runs on panel requests, so the moment one
+        # refresh finished the next call started another: a permanent train of
+        # `node runner.mjs` processes several times a second for as long as the
+        # app was open, which cost more CPU than everything else in the host put
+        # together. The in-flight lock only stopped them overlapping, not
+        # repeating. _read_models_cache() without allow_stale already applies
+        # _MODELS_TTL_S, so let it say whether a refresh is due.
+        if api_key and _read_models_cache() is None:
             _refresh_models_async(api_key)
         return cached
     if not api_key:
