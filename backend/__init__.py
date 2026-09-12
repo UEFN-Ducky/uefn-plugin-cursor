@@ -80,6 +80,7 @@ def _fetch_models(api_key: str, **_kw: Any) -> Any:
         _refresh_models_async,
         _write_models_cache,
     )
+    from .cursor_effort import row_supports_thinking_effort
 
     key = (api_key or "").strip()
     if key:
@@ -101,6 +102,7 @@ def _fetch_models(api_key: str, **_kw: Any) -> Any:
                 display_name=str(row.get("name") or mid).strip() or mid,
                 supports_tools=True,
                 supports_vision=True,
+                supports_thinking_effort=row_supports_thinking_effort(row),
             )
         )
     return out
@@ -138,6 +140,7 @@ def register(api) -> None:
         fetch_models=_fetch_models,
         test_key=_test_key,
         key_optional=False,
+        shows_thinking_effort=True,
     )
     api.register_coding_agent(
         "cursor",
@@ -151,6 +154,7 @@ def register(api) -> None:
         install_help=_INSTALL_HELP,
         token_provider="cursor",
         login_status_ok="api key saved",
+        shows_thinking_effort=True,
     )
     api.register_ide_hookup("cursor", label="Cursor")
     try:

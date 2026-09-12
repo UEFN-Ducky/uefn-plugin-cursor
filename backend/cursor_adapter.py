@@ -26,6 +26,7 @@ from backend.agent.coding_agents.cli_pty import run_cli_in_terminal
 from backend.agent.coding_agents.mcp_inject import coding_agents_tmp_dir
 from backend.agent.coding_agents.proc_exec import run_streaming_process
 from backend.agent.coding_agents.settings_helpers import coding_agent_cfg
+from .cursor_effort import model_params, sdk_param_map, row_supports_thinking_effort
 from .cursor_tool_unwrap import unwrap_cursor_tool
 
 # #region agent log
@@ -148,6 +149,10 @@ async function main() {
     cfg.mcpServers && Object.keys(cfg.mcpServers).length > 0
       ? cfg.mcpServers
       : undefined;
+  const modelSel =
+    Array.isArray(cfg.modelParams) && cfg.modelParams.length
+      ? { id: cfg.model, params: cfg.modelParams }
+      : { id: cfg.model };
 
   let agent = null;
   let resumed = false;
@@ -155,7 +160,7 @@ async function main() {
     try {
       agent = await sdk.Agent.resume(cfg.agentId, {
         apiKey: cfg.apiKey,
-        model: { id: cfg.model },
+        model: modelSel,
         mcpServers,
       });
       resumed = true;
@@ -174,7 +179,7 @@ async function main() {
   if (!agent) {
     agent = await sdk.Agent.create({
       apiKey: cfg.apiKey,
-      model: { id: cfg.model },
+      model: modelSel,
       local: { cwd: cfg.cwd, settingSources: [] },
       mcpServers,
     });
@@ -905,6 +910,16 @@ def _write_models_cache(models: list[dict[str, Any]]) -> None:
         pass
 
 
+def _cached_model_row(model_id: str) -> dict[str, Any] | None:
+    mid = (model_id or "").strip()
+    if not mid:
+        return None
+    for row in _read_models_cache(allow_stale=True) or []:
+        if str(row.get("id") or "").strip() == mid:
+            return row
+    return None
+
+
 def _fetch_models_via_sdk(api_key: str) -> list[dict[str, Any]] | None:
     if not api_key:
         return None
@@ -920,21 +935,21 @@ def _fetch_models_via_sdk(api_key: str) -> list[dict[str, Any]] | None:
         return None
     if not isinstance(raw, list):
         return None
-    models = [
-        {
-            "id": "auto" if str(m.get("id") or "").strip().lower() == "default" else str(m.get("id")),
-            # Keep the catalog label, while normalizing its legacy `default`
-            # alias to the documented SDK invocation id above.
-            "name": (
-                "Auto"
-                if str(m.get("id") or "").strip().lower() == "default"
-                else str(m.get("displayName") or m.get("id"))
-            ),
+    models: list[dict[str, Any]] = []
+    for m in raw:
+        if not isinstance(m, dict) or not str(m.get("id") or "").strip():
+            continue
+        raw_id = str(m.get("id") or "").strip()
+        is_default = raw_id.lower() == "default"
+        row: dict[str, Any] = {
+            "id": "auto" if is_default else raw_id,
+            "name": "Auto" if is_default else str(m.get("displayName") or raw_id),
             "provider": "Cursor",
         }
-        for m in raw
-        if isinstance(m, dict) and str(m.get("id") or "").strip()
-    ]
+        params = sdk_param_map(m)
+        if params:
+            row["params"] = params
+        models.append(row)
     return models or None
 
 
@@ -1046,6 +1061,7 @@ class CursorAdapter:
         session_id: str = "",
         cancel: threading.Event | None = None,
         timeout_s: float = 0.0,
+        env: dict[str, str] | None = None,
     ) -> CodingAgentLaunchResult | None:
         """Run Cursor via @cursor/sdk with live NDJSON streaming into ``push``."""
         if not api_key:
@@ -1065,6 +1081,8 @@ class CursorAdapter:
             except (OSError, json.JSONDecodeError):
                 mcp_servers = {}
 
+        effort = str((env or {}).get("DUCKY_THINKING_EFFORT") or "").strip()
+        params = model_params(_cached_model_row(model), effort)
         cfg = {
             "cmd": "prompt",
             "apiKey": api_key,
@@ -1074,6 +1092,8 @@ class CursorAdapter:
             "mcpServers": mcp_servers,
             "agentId": (session_id or "").strip(),
         }
+        if params:
+            cfg["modelParams"] = params
         cfg_path: Path | None = None
         try:
             fd, cfg_name = tempfile.mkstemp(
@@ -1244,6 +1264,7 @@ class CursorAdapter:
             session_id=session_id,
             cancel=cancel,
             timeout_s=timeout_s,
+            env=env,
         )
         if sdk is not None:
             return sdk
