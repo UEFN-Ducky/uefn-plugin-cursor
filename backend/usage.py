@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -65,6 +67,42 @@ def reset_at_iso(value: Any) -> str:
             return ""
     hour = dt.strftime("%I").lstrip("0") or "12"
     return f"Resets {dt.strftime('%a')} {hour}:{dt.strftime('%M %p')}"
+
+
+def _notice(message: str, *, action: str = "retry", label: str = "Refresh") -> dict[str, Any]:
+    return {
+        "windows": [],
+        "notice": {
+            "message": message,
+            "action": action,
+            "action_label": label,
+            "provider_id": "cursor",
+            "agent_id": "cursor",
+        },
+    }
+
+
+def jwt_sub(token: str) -> str:
+    parts = (token or "").split(".")
+    if len(parts) < 2:
+        return ""
+    pad = "=" * (-len(parts[1]) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
+    except Exception:
+        return ""
+    return str(payload.get("sub") or "").strip() if isinstance(payload, dict) else ""
+
+
+def session_cookie_from_token(token: str) -> str:
+    """Cursor usage-summary wants WorkosCursorSessionToken={sub}::{jwt}, not the JWT alone."""
+    raw = (token or "").strip()
+    if not raw:
+        return ""
+    if "::" in raw or "%3A%3A" in raw:
+        return raw
+    sub = jwt_sub(raw)
+    return f"{sub}::{raw}" if sub else raw
 
 
 def _pct_row(wid: str, label: str, used_pct: float, *, reset: str = "") -> dict[str, Any]:
@@ -171,7 +209,7 @@ def windows_from_headers(headers: Any) -> list[dict[str, Any]]:
 def _cursor_session() -> str:
     env = (os.environ.get("CURSOR_SESSION_TOKEN") or "").strip()
     if env:
-        return env
+        return session_cookie_from_token(env)
     appdata = os.environ.get("APPDATA") or ""
     db = Path(appdata) / "Cursor" / "User" / "globalStorage" / "state.vscdb"
     if not db.is_file():
@@ -184,9 +222,9 @@ def _cursor_session() -> str:
             ).fetchone()
             token = str(row[0] if row else "").strip()
             if token and not token.startswith("{"):
-                return token
+                return session_cookie_from_token(token)
             row = con.execute("SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'").fetchone()
-            return str(row[0] if row else "").strip()
+            return session_cookie_from_token(str(row[0] if row else "").strip())
         finally:
             con.close()
     except Exception:
@@ -209,11 +247,15 @@ def fetch_usage(api_key: str, *, model: str = "") -> dict[str, Any]:
                 rows = windows_from_cursor(r.json())
                 if rows:
                     return {"windows": rows}
+            if r.status_code in (401, 403):
+                return _notice("Cursor session expired. Sign in to Cursor, then press Refresh.")
         except Exception:
             pass
     key = (api_key or "").strip()
     if not key:
-        return {"windows": []}
+        if session:
+            return _notice("Couldn't read Cursor plan limits. Sign in to Cursor, then press Refresh.")
+        return _notice("Sign in to Cursor on this PC, then press Refresh.")
     try:
         import httpx
 
@@ -223,6 +265,9 @@ def fetch_usage(api_key: str, *, model: str = "") -> dict[str, Any]:
             timeout=8.0,
             follow_redirects=True,
         )
-        return {"windows": windows_from_headers(r.headers)}
+        rows = windows_from_headers(r.headers)
+        if rows:
+            return {"windows": rows}
     except Exception:
-        return {"windows": []}
+        pass
+    return _notice("Couldn't read Cursor plan limits. Sign in to Cursor, then press Refresh.")

@@ -1,6 +1,16 @@
 from __future__ import annotations
 
-from usage import windows_from_cursor, windows_from_headers
+from usage import session_cookie_from_token, windows_from_cursor, windows_from_headers
+
+
+def test_session_cookie_prefixes_jwt_sub() -> None:
+    import base64
+    import json
+
+    payload = base64.urlsafe_b64encode(json.dumps({"sub": "user_abc"}).encode()).decode().rstrip("=")
+    token = f"eyJhbGciOiJub25lIn0.{payload}.sig"
+    assert session_cookie_from_token(token) == f"user_abc::{token}"
+    assert session_cookie_from_token("already::token") == "already::token"
 
 
 def test_five_hour_and_weekly_from_vendor_json() -> None:
