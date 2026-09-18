@@ -72,6 +72,8 @@ def _skills_dir() -> str:
 
 def _fetch_models(api_key: str, **_kw: Any) -> Any:
     """Populate Settings → Default Model / catalog from Cursor.models.list (+ cache)."""
+    from dataclasses import fields
+
     from backend.agent.model_fetch import ModelInfo
 
     from .cursor_adapter import (
@@ -81,7 +83,7 @@ def _fetch_models(api_key: str, **_kw: Any) -> Any:
         _refresh_models_async,
         _write_models_cache,
     )
-    from .cursor_effort import row_supports_thinking_effort
+    from .cursor_effort import row_supports_thinking_effort, row_thinking_menu
 
     key = (api_key or "").strip()
     # Only go to the SDK when the cached catalog is missing or past its TTL.
@@ -101,15 +103,16 @@ def _fetch_models(api_key: str, **_kw: Any) -> Any:
         mid = str(row.get("id") or "").strip()
         if not mid:
             continue
-        out.append(
-            ModelInfo(
-                id=mid,
-                display_name=str(row.get("name") or mid).strip() or mid,
-                supports_tools=True,
-                supports_vision=True,
-                supports_thinking_effort=row_supports_thinking_effort(row),
-            )
-        )
+        kw = {
+            "id": mid,
+            "display_name": str(row.get("name") or mid).strip() or mid,
+            "supports_tools": True,
+            "supports_vision": True,
+            "supports_thinking_effort": row_supports_thinking_effort(row),
+            "thinking_menu": row_thinking_menu(row),
+        }
+        names = {f.name for f in fields(ModelInfo)}
+        out.append(ModelInfo(**{k: v for k, v in kw.items() if k in names}))
     return out
 
 

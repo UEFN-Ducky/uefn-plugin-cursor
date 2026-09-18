@@ -69,6 +69,48 @@ def row_supports_thinking_effort(row: dict[str, Any] | None) -> bool:
     return any(params.get(k) for k in _EFFORT_PARAM_IDS)
 
 
+def row_thinking_menu(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Menu stops from Cursor.models.list params. Off is always first."""
+    if not row_supports_thinking_effort(row):
+        return None
+    params = (row or {}).get("params") if isinstance(row, dict) else {}
+    if not isinstance(params, dict):
+        return None
+    seen: dict[str, str] = {}
+    thinking_vals = {str(v).strip().lower() for v in (params.get("thinking") or [])}
+    if "false" in thinking_vals or "none" in {str(v).strip().lower() for pid in ("effort", "reasoning", "reasoning_effort") for v in (params.get(pid) or [])}:
+        seen["off"] = "off"
+    for pid in ("effort", "reasoning", "reasoning_effort"):
+        for raw in params.get(pid) or []:
+            val = str(raw).strip().lower()
+            if not val:
+                continue
+            if val in ("none", "minimal", "false"):
+                seen["off"] = "off"
+                continue
+            seen[val] = val
+    if "off" not in seen:
+        seen["off"] = "off"
+    order = ["off", "low", "medium", "high", "xhigh", "extra-high", "max"]
+    levels: list[dict[str, Any]] = []
+    for key in order:
+        if key not in seen:
+            continue
+        levels.append(
+            {
+                "id": "off" if key == "off" else key,
+                "label": "Off" if key == "off" else key.replace("-", " ").title(),
+                "thinking_tokens": 0 if key == "off" else None,
+                "hint": "No extended thinking" if key == "off" else f"{key}, no token cap",
+            }
+        )
+    extra = [k for k in seen if k not in order]
+    extra.sort()
+    for key in extra:
+        levels.append({"id": key, "label": key, "thinking_tokens": None, "hint": f"{key}, no token cap"})
+    return {"lo": "Faster", "hi": "Smarter", "levels": levels}
+
+
 def sdk_param_map(raw: dict[str, Any]) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for pd in raw.get("parameters") or []:

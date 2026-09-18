@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from cursor_effort import model_params, pick_level, row_supports_thinking_effort
+from cursor_effort import model_params, pick_level, row_supports_thinking_effort, row_thinking_menu
 
 CLAUDE = {
     "id": "claude-sonnet-5",
@@ -57,6 +57,11 @@ def test_auto_has_no_params() -> None:
     assert model_params(AUTO, "high") == []
     assert row_supports_thinking_effort(AUTO) is False
     assert row_supports_thinking_effort(CLAUDE) is True
+    assert row_thinking_menu(AUTO) is None
+    claude_ids = [l["id"] for l in (row_thinking_menu(CLAUDE) or {}).get("levels") or []]
+    assert claude_ids[0] == "off"
+    assert "xhigh" in claude_ids
+    assert "low" in claude_ids
 
 
 if __name__ == "__main__":
