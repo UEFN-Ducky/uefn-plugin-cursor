@@ -70,6 +70,12 @@ def _skills_dir() -> str:
     return str(Path.home() / ".cursor" / "skills")
 
 
+def _fetch_usage(api_key: str, **kw: Any) -> Any:
+    from .usage import fetch_usage
+
+    return fetch_usage(api_key, model=str(kw.get("model") or ""))
+
+
 def _fetch_models(api_key: str, **_kw: Any) -> Any:
     """Populate Settings → Default Model / catalog from Cursor.models.list (+ cache)."""
     from dataclasses import fields
@@ -146,6 +152,7 @@ def register(api) -> None:
         "cursor",
         factory=_provider_factory,
         fetch_models=_fetch_models,
+        fetch_usage=_fetch_usage,
         test_key=_test_key,
         key_optional=False,
         shows_thinking_effort=True,
