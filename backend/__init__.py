@@ -178,4 +178,7 @@ def register(api) -> None:
         schedule_cli_update_on_plugin_load()
     except Exception:
         pass
+    from . import graph_nodes
+
+    graph_nodes.register_nodes(api)
     api.log("Cursor gateway contribution active (Providers + Coding Agents + IDE + Models)")
