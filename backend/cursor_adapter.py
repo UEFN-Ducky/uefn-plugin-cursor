@@ -114,13 +114,34 @@ function toolArgs(tc) {
   return unwrapToolCall(tc).args;
 }
 
+function stripImageBlobs(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((block) => !(block && block.type === "image"))
+      .map(stripImageBlobs);
+  }
+  if (!value || typeof value !== "object") return value;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (
+      (key === "png_base64" || key === "base64" || key === "data_base64") &&
+      typeof item === "string" &&
+      item.length > 200
+    ) {
+      continue;
+    }
+    out[key] = stripImageBlobs(item);
+  }
+  return out;
+}
+
 function toolResultText(tc) {
   if (!tc || typeof tc !== "object") return "";
   const r = tc.result ?? tc.output ?? tc.content ?? tc.response;
   if (r == null) return "";
   if (typeof r === "string") return r;
   try {
-    return JSON.stringify(r);
+    return JSON.stringify(stripImageBlobs(r));
   } catch {
     return String(r);
   }
@@ -1243,6 +1264,17 @@ class CursorAdapter:
             full_prompt += (
                 "\n\nThe user attached image file(s) with this message. Read these absolute "
                 f"paths to view them:\n{listed}"
+            )
+        try:
+            from frontend.ui_web.conversation_attachments import chat_attachments_dir
+
+            captures = chat_attachments_dir(conv_id, create=True)
+        except Exception:
+            captures = None
+        if captures is not None:
+            full_prompt += (
+                "\n\nUEFN Ducky screenshots for this chat are PNG files in this folder. "
+                f"Read them here:\n- {captures}"
             )
 
         # A model must be selected explicitly. Cursor's advertised `default`
