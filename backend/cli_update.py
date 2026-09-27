@@ -62,24 +62,15 @@ def needs_plugin_load_update() -> bool:
 
 
 def update_sdk() -> dict[str, Any]:
-    """Drop the install stamp so @cursor/sdk@latest is pulled again."""
+    """Pull @cursor/sdk@latest. A failed npm install keeps the copy already on disk."""
     global _busy, _last
     with _update_lock:
         _busy = True
         try:
-            try:
-                sdk_installed_stamp().unlink(missing_ok=True)
-            except OSError:
-                pass
             from .cursor_adapter import _cursor_sdk_sandbox
 
-            root = _cursor_sdk_sandbox()
-            result = {
-                "ok": root is not None,
-                "message": "Cursor SDK updated" if root is not None else "Cursor SDK update failed",
-                "error": "" if root is not None else "Node.js / npm required to install @cursor/sdk",
-            }
-            if result["ok"]:
+            root, installed = _cursor_sdk_sandbox(force=True)
+            if installed and root is not None:
                 write_stamp(
                     {
                         "plugin_version": plugin_package_version(),
@@ -87,6 +78,19 @@ def update_sdk() -> dict[str, Any]:
                         "ok": True,
                     }
                 )
+                result = {"ok": True, "message": "Cursor SDK updated", "error": ""}
+            elif root is not None:
+                result = {
+                    "ok": False,
+                    "message": "Cursor SDK update failed",
+                    "error": "npm install failed — using the SDK already on disk",
+                }
+            else:
+                result = {
+                    "ok": False,
+                    "message": "Cursor SDK update failed",
+                    "error": "Node.js / npm required to install @cursor/sdk",
+                }
             _last = result
             return result
         finally:

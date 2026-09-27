@@ -26,7 +26,12 @@ from backend.agent.coding_agents.cli_pty import run_cli_in_terminal
 from backend.agent.coding_agents.mcp_inject import coding_agents_tmp_dir
 from backend.agent.coding_agents.proc_exec import run_streaming_process
 from backend.agent.coding_agents.settings_helpers import coding_agent_cfg
-from .cursor_effort import model_params, sdk_param_map, row_supports_thinking_effort
+from .cursor_effort import (
+    model_params,
+    row_supports_thinking_effort,
+    row_thinking_menu,
+    sdk_param_map,
+)
 from .cursor_tool_unwrap import unwrap_cursor_tool
 
 # #region agent log
@@ -801,13 +806,19 @@ class _CursorStreamState:
             self.usage["context_tokens"] = self._last_step_context_tokens
 
 
-def _cursor_sdk_sandbox() -> Path | None:
-    """Cached AppData folder with @cursor/sdk installed for the Node runner."""
+def _sdk_package_dir(root: Path) -> Path:
+    return root / "node_modules" / "@cursor" / "sdk"
+
+
+def _cursor_sdk_sandbox(*, force: bool = False) -> tuple[Path | None, bool]:
+    """AppData folder with @cursor/sdk, and whether npm install succeeded now.
+
+    A missing npm, or a failed ``npm install``, still returns an install that
+    is already on disk. npm runs only when that tree is missing, or when
+    ``force`` asks for a refresh (plugin update).
+    """
     from frontend.settings import default_app_data_dir
 
-    npm = which_cli("npm") or which_cli("npm.cmd")
-    if not npm:
-        return None
     root = default_app_data_dir() / "coding_agents" / "cursor_sdk"
     root.mkdir(parents=True, exist_ok=True)
     runner = root / "runner.mjs"
@@ -815,29 +826,34 @@ def _cursor_sdk_sandbox() -> Path | None:
     stamp = root / ".installed"
     pkg_body = json.dumps({"type": "module", "dependencies": {"@cursor/sdk": "latest"}}, indent=2)
     runner_body = _CURSOR_SDK_RUNNER.strip() + "\n"
-    needs_install = (
-        not stamp.is_file()
-        or not (root / "node_modules" / "@cursor" / "sdk").is_dir()
-        or pkg.read_text(encoding="utf-8") != pkg_body
-    )
     pkg.write_text(pkg_body, encoding="utf-8")
     if not runner.is_file() or runner.read_text(encoding="utf-8") != runner_body:
         runner.write_text(runner_body, encoding="utf-8")
-    if needs_install:
+    ready = _sdk_package_dir(root).is_dir()
+    if ready and not force:
+        return root, False
+    npm = which_cli("npm") or which_cli("npm.cmd")
+    if not npm:
+        return (root, False) if ready else (None, False)
+    try:
+        proc = subprocess.run(
+            [npm, "install", "--omit=dev", "--no-audit", "--no-fund"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0 and _sdk_package_dir(root).is_dir():
         try:
-            proc = subprocess.run(
-                [npm, "install", "--omit=dev", "--no-audit", "--no-fund"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if proc.returncode != 0:
-            return None
-        stamp.write_text("ok", encoding="utf-8")
-    return root
+            stamp.write_text("ok", encoding="utf-8")
+        except OSError:
+            pass
+        return root, True
+    if _sdk_package_dir(root).is_dir():
+        return root, False
+    return None, False
 
 
 def _run_sdk_runner(cfg: dict[str, Any], *, api_key: str, timeout_s: float) -> subprocess.CompletedProcess | None:
@@ -848,7 +864,7 @@ def _run_sdk_runner(cfg: dict[str, Any], *, api_key: str, timeout_s: float) -> s
     node = which_cli("node") or which_cli("node.exe")
     if not node:
         return None
-    sandbox = _cursor_sdk_sandbox()
+    sandbox, _installed = _cursor_sdk_sandbox()
     if sandbox is None:
         return None
     cfg_path: Path | None = None
@@ -941,6 +957,74 @@ def _cached_model_row(model_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _normalize_listed_model(m: Any) -> dict[str, Any] | None:
+    if isinstance(m, str):
+        raw_id = m.strip()
+        if not raw_id:
+            return None
+        is_default = raw_id.lower() == "default"
+        return {
+            "id": "auto" if is_default else raw_id,
+            "name": "Auto" if is_default else raw_id,
+            "provider": "Cursor",
+        }
+    if not isinstance(m, dict):
+        return None
+    raw_id = str(m.get("id") or "").strip()
+    if not raw_id:
+        return None
+    is_default = raw_id.lower() == "default"
+    row: dict[str, Any] = {
+        "id": "auto" if is_default else raw_id,
+        "name": "Auto" if is_default else str(m.get("displayName") or m.get("name") or raw_id),
+        "provider": "Cursor",
+    }
+    params = sdk_param_map(m)
+    if not params and isinstance(m.get("params"), dict):
+        params = {str(k): list(v) for k, v in m["params"].items() if isinstance(v, list)}
+    if params:
+        row["params"] = params
+    return row
+
+
+def _rows_from_api_payload(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, dict):
+        raw = raw.get("models") if "models" in raw else raw.get("data")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        row = _normalize_listed_model(item)
+        if row:
+            out.append(row)
+    return out
+
+
+def _fetch_models_via_http(api_key: str) -> list[dict[str, Any]] | None:
+    """Model ids from the Cursor API. No Node. Used when the SDK install is down."""
+    key = (api_key or "").strip()
+    if not key:
+        return None
+    try:
+        import httpx
+
+        res = httpx.get(
+            "https://api.cursor.com/v0/models",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=8.0,
+            follow_redirects=True,
+        )
+    except Exception:
+        return None
+    if res.status_code >= 400:
+        return None
+    try:
+        rows = _rows_from_api_payload(res.json())
+    except Exception:
+        return None
+    return rows or None
+
+
 def _fetch_models_via_sdk(api_key: str) -> list[dict[str, Any]] | None:
     if not api_key:
         return None
@@ -954,24 +1038,72 @@ def _fetch_models_via_sdk(api_key: str) -> list[dict[str, Any]] | None:
         raw = json.loads((proc.stdout or "").strip() or "[]")
     except json.JSONDecodeError:
         return None
-    if not isinstance(raw, list):
-        return None
-    models: list[dict[str, Any]] = []
-    for m in raw:
-        if not isinstance(m, dict) or not str(m.get("id") or "").strip():
+    return _rows_from_api_payload(raw) or None
+
+
+def _model_infos_from_rows(rows: list[dict[str, Any]]) -> list[Any]:
+    from dataclasses import fields
+
+    from backend.agent.model_fetch import ModelInfo
+
+    out: list[Any] = []
+    names = {f.name for f in fields(ModelInfo)}
+    for row in rows:
+        mid = str(row.get("id") or "").strip()
+        if not mid:
             continue
-        raw_id = str(m.get("id") or "").strip()
-        is_default = raw_id.lower() == "default"
-        row: dict[str, Any] = {
-            "id": "auto" if is_default else raw_id,
-            "name": "Auto" if is_default else str(m.get("displayName") or raw_id),
-            "provider": "Cursor",
+        kw = {
+            "id": mid,
+            "display_name": str(row.get("name") or mid).strip() or mid,
+            "supports_tools": True,
+            "supports_vision": True,
+            "supports_thinking_effort": row_supports_thinking_effort(row),
+            "thinking_menu": row_thinking_menu(row),
         }
-        params = sdk_param_map(m)
-        if params:
-            row["params"] = params
-        models.append(row)
-    return models or None
+        out.append(ModelInfo(**{k: v for k, v in kw.items() if k in names}))
+    return out
+
+
+def _publish_cached_models() -> None:
+    """Copy cursor_models.json into the host catalog and wake an open picker."""
+    infos = _model_infos_from_rows(_read_models_cache(allow_stale=True) or [])
+    if not infos:
+        return
+    try:
+        from frontend.ui_web import panel_api as pa
+
+        pa._model_cache["cursor"] = list(infos)
+        pa._save_model_cache_to_disk()
+        pa._notify_models_updated()
+    except Exception:
+        pass
+    try:
+        from backend.agent.coding_agents.base import invalidate_detect_cache, kick_detect_refresh
+
+        invalidate_detect_cache()
+        kick_detect_refresh()
+    except Exception:
+        pass
+
+
+def _store_live_models(models: list[dict[str, Any]]) -> None:
+    _write_models_cache(models)
+    _publish_cached_models()
+
+
+def _fetch_live_models(api_key: str) -> list[dict[str, Any]] | None:
+    """SDK list when @cursor/sdk is already installed; otherwise the HTTPS list.
+
+    Does not run npm. A missing SDK must not block the picker.
+    """
+    from frontend.settings import default_app_data_dir
+
+    root = default_app_data_dir() / "coding_agents" / "cursor_sdk"
+    if _sdk_package_dir(root).is_dir():
+        sdk_rows = _fetch_models_via_sdk(api_key)
+        if sdk_rows:
+            return sdk_rows
+    return _fetch_models_via_http(api_key)
 
 
 def _refresh_models_async(api_key: str) -> None:
@@ -984,9 +1116,9 @@ def _refresh_models_async(api_key: str) -> None:
     def work() -> None:
         global _models_refresh_inflight
         try:
-            models = _fetch_models_via_sdk(api_key)
+            models = _fetch_live_models(api_key)
             if models:
-                _write_models_cache(models)
+                _store_live_models(models)
         finally:
             with _models_refresh_lock:
                 _models_refresh_inflight = False
@@ -1010,9 +1142,9 @@ def _known_models(api_key: str = "") -> list[dict[str, Any]]:
         return cached
     if not api_key:
         return []
-    live = _fetch_models_via_sdk(api_key)
+    live = _fetch_live_models(api_key)
     if live:
-        _write_models_cache(live)
+        _store_live_models(live)
         return live
     return []
 
@@ -1098,7 +1230,7 @@ class CursorAdapter:
         node = which_cli("node") or which_cli("node.exe")
         if not node:
             return None
-        sandbox = _cursor_sdk_sandbox()
+        sandbox, _installed = _cursor_sdk_sandbox()
         if sandbox is None:
             return None
 

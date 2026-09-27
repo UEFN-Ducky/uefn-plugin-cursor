@@ -77,49 +77,17 @@ def _fetch_usage(api_key: str, **kw: Any) -> Any:
 
 
 def _fetch_models(api_key: str, **_kw: Any) -> Any:
-    """Populate Settings → Default Model / catalog from Cursor.models.list (+ cache)."""
-    from dataclasses import fields
+    """Catalog rows from cursor_models.json, else the HTTPS list, else the SDK."""
+    from .cursor_adapter import _known_models, _model_infos_from_rows
 
-    from backend.agent.model_fetch import ModelInfo
+    return _model_infos_from_rows(_known_models((api_key or "").strip()))
 
-    from .cursor_adapter import (
-        _fetch_models_via_sdk,
-        _known_models,
-        _read_models_cache,
-        _refresh_models_async,
-        _write_models_cache,
-    )
-    from .cursor_effort import row_supports_thinking_effort, row_thinking_menu
 
-    key = (api_key or "").strip()
-    # Only go to the SDK when the cached catalog is missing or past its TTL.
-    # This used to run _fetch_models_via_sdk on every call, and every one of
-    # those is a `node runner.mjs` process — so opening the model picker, or
-    # anything else that refreshed the catalog, spawned Node each time.
-    if key and _read_models_cache() is None:
-        live = _fetch_models_via_sdk(key)
-        if live:
-            _write_models_cache(live)
-        else:
-            # Keep UI responsive — serve cache while SDK refresh runs.
-            _refresh_models_async(key)
+def read_cached_models() -> Any:
+    """Disk catalog only. Safe on the panel request thread — no Node, no HTTP."""
+    from .cursor_adapter import _model_infos_from_rows, _read_models_cache
 
-    out: list[ModelInfo] = []
-    for row in _known_models(key):
-        mid = str(row.get("id") or "").strip()
-        if not mid:
-            continue
-        kw = {
-            "id": mid,
-            "display_name": str(row.get("name") or mid).strip() or mid,
-            "supports_tools": True,
-            "supports_vision": True,
-            "supports_thinking_effort": row_supports_thinking_effort(row),
-            "thinking_menu": row_thinking_menu(row),
-        }
-        names = {f.name for f in fields(ModelInfo)}
-        out.append(ModelInfo(**{k: v for k, v in kw.items() if k in names}))
-    return out
+    return _model_infos_from_rows(_read_models_cache(allow_stale=True) or [])
 
 
 def _provider_factory(api_key: str, model: str, **_kw: Any) -> Any:
@@ -153,6 +121,7 @@ def register(api) -> None:
         factory=_provider_factory,
         fetch_models=_fetch_models,
         fetch_usage=_fetch_usage,
+        read_cached_models=read_cached_models,
         test_key=_test_key,
         key_optional=False,
         shows_thinking_effort=True,
