@@ -835,13 +835,16 @@ def _cursor_sdk_sandbox(*, force: bool = False) -> tuple[Path | None, bool]:
     npm = which_cli("npm") or which_cli("npm.cmd")
     if not npm:
         return (root, False) if ready else (None, False)
+    from .cli_update import hidden_run_kwargs, npm_argv
+
     try:
         proc = subprocess.run(
-            [npm, "install", "--omit=dev", "--no-audit", "--no-fund"],
+            npm_argv(npm, ["install", "--omit=dev", "--no-audit", "--no-fund"]),
             cwd=root,
             capture_output=True,
             text=True,
             timeout=300,
+            **hidden_run_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         proc = None
@@ -884,8 +887,9 @@ def _run_sdk_runner(cfg: dict[str, Any], *, api_key: str, timeout_s: float) -> s
                 "NODE_NO_WARNINGS": "1",
             },
         }
-        if os.name == "nt":
-            run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        from .cli_update import hidden_run_kwargs
+
+        run_kwargs.update(hidden_run_kwargs())
         return subprocess.run(
             [node, str(sandbox / "runner.mjs"), str(cfg_path)],
             **run_kwargs,

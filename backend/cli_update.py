@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -52,6 +54,41 @@ def status_text() -> str:
     if _busy:
         return "Updating Cursor SDK…"
     return str(_last.get("message") or "")
+
+
+def hidden_run_kwargs() -> dict[str, Any]:
+    """No console. npm.cmd still flashes — call npm through npm_argv()."""
+    if os.name != "nt":
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": info,
+    }
+
+
+def npm_argv(npm: str, args: list[str]) -> list[str]:
+    """node.exe + npm-cli.js. npm.cmd is a batch file and opens a console."""
+    bases: list[Path] = [Path(npm).parent]
+    found = shutil.which("node")
+    if found:
+        bases.append(Path(found).parent)
+    seen: set[str] = set()
+    for base in bases:
+        key = str(base).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        node = base / "node.exe"
+        if not node.is_file():
+            alt = base / "node"
+            node = alt if alt.is_file() else node
+        cli = base / "node_modules" / "npm" / "bin" / "npm-cli.js"
+        if node.is_file() and cli.is_file():
+            return [str(node), str(cli), *args]
+    return [npm, *args]
 
 
 def needs_plugin_load_update() -> bool:
