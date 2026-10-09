@@ -1,0 +1,322 @@
+"""Agent-only public contract; no SDK/provider invocation."""
+import ast
+import dataclasses
+import importlib.util
+import itertools
+import json
+import subprocess
+import sys
+import threading
+import types
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+from backend.agent.coding_agents import base
+from backend.agent.coding_agents.proc_exec import ProcResult
+
+
+def load_adapter(monkeypatch, name="_cursor_modes"):
+    package = types.ModuleType(name)
+    package.__path__ = [str(ROOT / "backend")]
+    monkeypatch.setitem(sys.modules, name, package)
+    spec = importlib.util.spec_from_file_location(name + ".cursor_adapter", ROOT / "backend/cursor_adapter.py")
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "_dbg_tool_pairing", lambda *args, **kw: None)
+    return module
+
+
+@pytest.fixture
+def launch(monkeypatch, tmp_path):
+    a = load_adapter(monkeypatch)
+    from backend.agent import secrets
+    from frontend.ui_web import conversation_attachments
+    monkeypatch.setattr(secrets, "get_key", lambda *args: "synthetic-key")
+    monkeypatch.setattr(conversation_attachments, "chat_attachments_dir", lambda *args, **kw: None)
+    monkeypatch.setattr(a, "which_cli", lambda *args: "mock-node")
+    monkeypatch.setattr(a, "_cursor_sdk_sandbox", lambda: (tmp_path, False))
+    monkeypatch.setattr(a, "_cached_model_row", lambda *args: {})
+    monkeypatch.setattr(a, "coding_agents_tmp_dir", lambda: tmp_path)
+    records, events = [], []
+    stream = [{"type": "text_delta", "text": "legitimate reply"}, {"type": "done", "status": "finished"}]
+    proc = ProcResult(returncode=0)
+    def process(**kw):
+        cfg = json.loads(Path(kw["argv"][-1]).read_text())
+        records.append(cfg)
+        kw["on_line"](json.dumps({"type": "meta", "agentId": cfg["agentId"] or "new-session"}))
+        for event in stream:
+            kw["on_line"](event if isinstance(event, str) else json.dumps(event))
+        return invoke.proc
+    monkeypatch.setattr(a, "run_streaming_process", process)
+    config = tmp_path / "mcp.json"
+    config.write_text(json.dumps({"mcpServers": {"uefn": {"command": "mock-bridge"}}}))
+    def invoke(session="", **kwargs):
+        args = dict(prompt="original", system_prompt="bootstrap", cwd=str(tmp_path), conv_id="test",
+                    model="default", mcp_config_path=str(config), extra_args="", cli_path="", env={},
+                    push=events.append, session_id=session, run_id="run")
+        args.update(kwargs)
+        return invoke.instance.launch(**args)
+    invoke.a, invoke.instance = a, a.CursorAdapter()
+    invoke.records, invoke.events, invoke.stream, invoke.proc = records, events, stream, proc
+    invoke.process, invoke.config = process, config
+    yield invoke
+    for name in list(sys.modules):
+        if name.startswith("_cursor_modes."):
+            sys.modules.pop(name, None)
+
+
+@pytest.mark.parametrize("session", ["", "prior-session"])
+@pytest.mark.parametrize("mode,canonical", [(None,"agent"),("","agent"),("AGENT","agent"),(" Agent ","agent"),("ask","ask"),(" Plan ","plan"),(" ",""),(0,""),(False,""),([],""),("unknown","")])
+def test_modes_and_metadata(launch, session, mode, canonical):
+    result = launch(session, mode=mode)
+    assert result.requested_mode == canonical
+    assert result.ok is (canonical == "agent")
+    assert result.effective_mode == ("agent" if result.ok else "")
+    assert result.upstream_session_id == (session or "new-session") if result.ok else result.upstream_session_id == session
+    assert len(launch.records) == int(result.ok)
+
+
+@pytest.mark.parametrize("mode", ["ask", "plan", "invalid", 7])
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("session", ["", "prior-session"])
+def test_refusal_precedes_every_side_effect(launch, monkeypatch, mode, cancelled, session):
+    def forbidden(*args, **kwargs): raise AssertionError("side effect before refusal")
+    from backend.agent import secrets
+    from frontend.ui_web import conversation_attachments
+    for name in ("_ducky_preflight", "_read_ducky_mcp_config", "which_cli", "_cursor_sdk_sandbox", "_cached_model_row", "coding_agents_tmp_dir", "run_streaming_process"):
+        monkeypatch.setattr(launch.a, name, forbidden)
+    monkeypatch.setattr(secrets, "get_key", forbidden)
+    monkeypatch.setattr(conversation_attachments, "chat_attachments_dir", forbidden)
+    monkeypatch.setattr(launch.a.tempfile, "mkstemp", forbidden)
+    cancel = threading.Event()
+    if cancelled: cancel.set()
+    result = launch(session, mode=mode, cancel=cancel)
+    assert not result.ok and result.status == "error"  # mode refusal wins
+    assert result.upstream_session_id == session and result.effective_mode == ""
+
+
+def test_core_refusal_and_six_turn_sequence(launch):
+    session = ""
+    for mode in ("agent", "ask", "plan", "agent", "plan", "ask"):
+        if mode != "agent":
+            with pytest.raises(ValueError, match="does not support"):
+                base.coding_mode_launch_kwargs(launch.instance, mode)
+            continue
+        result = launch(session, **base.coding_mode_launch_kwargs(launch.instance, mode))
+        assert result.ok
+        session = result.upstream_session_id
+    assert [r["agentId"] for r in launch.records] == ["", "new-session"]
+    assert getattr(launch.instance.capabilities, "supported_modes") == ("agent",)
+
+
+@pytest.mark.parametrize("boundary", ["config", "key", "node", "setup", "model", "helper", "process", "cancel", "timeout", "error", "reset"])
+@pytest.mark.parametrize("session", ["", "prior-session"])
+def test_all_returns_have_authoritative_modes(launch, monkeypatch, boundary, session):
+    from backend.agent import secrets
+    kwargs = {}
+    def fail(*args, **kw): raise RuntimeError("PRIVATE_SYNTHETIC")
+    if boundary == "config": launch.config.write_bytes(b"\xff\xfe\x80")
+    elif boundary == "key": monkeypatch.setattr(secrets, "get_key", lambda *a: "")
+    elif boundary == "node": monkeypatch.setattr(launch.a, "which_cli", lambda *a: None)
+    elif boundary == "setup": monkeypatch.setattr(launch.a, "_cursor_sdk_sandbox", fail)
+    elif boundary == "model": kwargs["model"] = ""
+    elif boundary == "helper": monkeypatch.setattr(launch.instance, "_try_node_sdk", lambda **kw: None)
+    elif boundary == "process": monkeypatch.setattr(launch.a, "run_streaming_process", fail)
+    elif boundary == "cancel":
+        kwargs["cancel"] = threading.Event(); kwargs["cancel"].set()
+    elif boundary == "timeout": launch.proc = ProcResult(returncode=0, timed_out=True)
+    elif boundary == "error": launch.proc = ProcResult(returncode=1)
+    else: launch.proc = ProcResult(returncode=3, stderr_tail=launch.a._SESSION_RESET)
+    result = launch(session, **kwargs)
+    assert not result.ok
+    assert (result.requested_mode, result.effective_mode) == ("agent", "")
+    expected_session = "" if boundary == "reset" else session or ("new-session" if boundary in ("timeout", "error") else "")
+    assert result.upstream_session_id == expected_session
+    assert "PRIVATE_SYNTHETIC" not in repr(result) + repr(launch.events)
+    assert not list(Path(launch.config.parent).glob("cursor-sdk-*.json"))
+
+
+def test_spoofed_events_and_result_metadata(launch, monkeypatch):
+    original = {"type": "text_delta", "text": "answer", "requested_mode": "plan", "effective_mode": "plan"}
+    def helper(**kw):
+        kw["push"](original)
+        return launch.a.CodingAgentLaunchResult(ok=True, status="done", requested_mode="ask", effective_mode="ask")
+    monkeypatch.setattr(launch.instance, "_try_node_sdk", helper)
+    result = launch()
+    assert (result.requested_mode, result.effective_mode) == ("agent", "agent")
+    assert launch.events[-1] == dict(original, requested_mode="agent", effective_mode="")
+    assert original["effective_mode"] == "plan"
+
+
+@pytest.mark.parametrize("session", ["", "prior-session"])
+def test_agent_configuration_and_stream_parity(launch, session):
+    launch.stream.insert(0, "malformed not JSON")
+    result = launch(session, image_paths=["synthetic-image.png"], extra_args="--mode plan", env={"DUCKY_REQUESTED_MODE":"ask"})
+    assert result.ok and result.reply_text == "legitimate reply"
+    cfg = launch.records[0]
+    assert cfg["model"] == "auto" and cfg["agentId"] == session
+    assert ("bootstrap" in cfg["prompt"]) is (not bool(session))
+    assert "synthetic-image.png" in cfg["prompt"]
+    assert cfg["mcpServers"] == {"uefn":{"command":"mock-bridge"}}
+    assert not {"mode", "tools", "sandboxOptions", "customTools"} & cfg.keys()
+    assert all(e["requested_mode"] == "agent" and e["effective_mode"] == "" for e in launch.events)
+
+
+@pytest.fixture(scope="module")
+def historical_classes():
+    # Read actual published 1.2.361 definitions, not guessed legacy signatures.
+    app = Path(base.__file__).resolve().parents[4]
+    source = subprocess.check_output(["git", "-C", str(app), "show",
+        "f2094f09307472a19fdd1edf762065649aa734dc:ducky_app/backend/agent/coding_agents/base.py"], text=True)
+    names = {"CodingAgentCapabilities", "CodingAgentInfo", "CodingAgentLaunchResult"}
+    body = [n for n in ast.parse(source).body if isinstance(n, ast.ClassDef) and n.name in names]
+    namespace = dict(dataclass=dataclasses.dataclass, field=dataclasses.field, Any=object)
+    exec(compile(ast.Module(body=body, type_ignores=[]), "<published-1.2.361-base>", "exec"), namespace)
+    return {name: namespace[name] for name in names}
+
+
+@pytest.mark.parametrize("caps_new,result_new,helper", list(itertools.product([False, True], repeat=3)))
+@pytest.mark.parametrize("session", ["", "prior-session"])
+def test_actual_host_loader_registration_mixed_hosts(launch, monkeypatch, historical_classes, caps_new, result_new, helper, session):
+    from backend.uefn_plugins import host
+    legacy = types.ModuleType(base.__name__)
+    legacy.CodingAgentCapabilities = base.CodingAgentCapabilities if caps_new else historical_classes["CodingAgentCapabilities"]
+    legacy.CodingAgentLaunchResult = base.CodingAgentLaunchResult if result_new else historical_classes["CodingAgentLaunchResult"]
+    legacy.CodingAgentInfo = historical_classes["CodingAgentInfo"]
+    legacy.which_cli = launch.a.which_cli
+    if helper: legacy.normalize_coding_mode = base.normalize_coding_mode
+    monkeypatch.setitem(sys.modules, base.__name__, legacy)
+    name = host.backend_module_name("cursor_modes_fixture")
+    monkeypatch.setitem(sys.modules, name + ".cli_update", types.SimpleNamespace(schedule_cli_update_on_plugin_load=lambda: None))
+    monkeypatch.setitem(sys.modules, name + ".graph_nodes", types.SimpleNamespace(register_nodes=lambda api: None))
+    monkeypatch.setattr(host, "_CODING_AGENT_FACTORIES", {})
+    api = host._PluginApi("cursor_modes_fixture")
+    for method in ("register_llm_provider", "register_ide_hookup", "log"):
+        monkeypatch.setattr(api, method, lambda *a, **kw: None)
+    try:
+        package = host._import_backend("cursor_modes_fixture", ROOT, "backend")
+        package.register(api)
+        instance = host.get_coding_agent_registration("cursor")["factory"]()
+        module = sys.modules[name + ".cursor_adapter"]
+        monkeypatch.setattr(module, "_dbg_tool_pairing", lambda *args, **kw: None)
+        assert module.CodingAgentLaunchResult is legacy.CodingAgentLaunchResult
+        for attr in ("which_cli", "_cursor_sdk_sandbox", "_cached_model_row", "coding_agents_tmp_dir", "run_streaming_process"):
+            monkeypatch.setattr(module, attr, getattr(launch.a, attr))
+        launch.instance = instance
+        result = launch(session, mode="agent")
+        assert type(result) is legacy.CodingAgentLaunchResult
+        assert type(instance.capabilities) is legacy.CodingAgentCapabilities
+        assert result.ok and result.reply_text == "legitimate reply"
+        serialized = result.to_dict()
+        assert serialized["upstream_session_id"] == (session or "new-session")
+        if result_new:
+            assert (serialized["requested_mode"], serialized["effective_mode"]) == ("agent", "agent")
+        else:
+            assert not hasattr(result, "requested_mode") and not hasattr(result, "effective_mode")
+        assert getattr(instance.capabilities, "supported_modes", ("agent",)) == ("agent",)
+        for mode in ("ask", "plan"):
+            with pytest.raises(ValueError): base.coding_mode_launch_kwargs(instance, mode)
+            refused = launch(session, mode=mode)
+            assert not refused.ok and refused.upstream_session_id == session
+        # Real preflight uses precisely the same concrete class as its isinstance check.
+        refused = launch(session, mcp_config_path="")
+        assert type(refused) is legacy.CodingAgentLaunchResult and not refused.ok
+        assert len(launch.records) == 1
+    finally:
+        for key in list(sys.modules):
+            if key == name or key.startswith(name + "."):
+                sys.modules.pop(key, None)
+
+
+@pytest.mark.parametrize("field", ["requested_mode", "effective_mode"])
+def test_partial_result_shapes(launch, monkeypatch, historical_classes, field):
+    cls = dataclasses.make_dataclass("PartialResult", [(field, str, "")], bases=(historical_classes["CodingAgentLaunchResult"],))
+    monkeypatch.setattr(launch.a, "CodingAgentLaunchResult", cls)
+    for mode in ("agent", "ask"):
+        result = launch("prior-session", mode=mode)
+        assert type(result) is cls
+        assert getattr(result, field) == (mode if field == "requested_mode" else "agent" if result.ok else "")
+
+
+def test_kwargs_only_capabilities_are_conservative(monkeypatch):
+    class Caps:
+        def __init__(self, **kwargs): self.__dict__.update(kwargs)
+    monkeypatch.setattr(base, "CodingAgentCapabilities", Caps)
+    a = load_adapter(monkeypatch, "_cursor_kwargs_caps")
+    assert not hasattr(a.CursorAdapter.capabilities, "supported_modes")
+    with pytest.raises(ValueError): base.coding_mode_launch_kwargs(a.CursorAdapter(), "ask")
+
+
+@pytest.mark.parametrize("symbol", ["CodingAgentCapabilities", "CodingAgentLaunchResult", "CodingAgentInfo", "which_cli"])
+def test_missing_mandatory_import_is_not_hidden(monkeypatch, symbol):
+    monkeypatch.delattr(base, symbol)
+    with pytest.raises(ImportError): load_adapter(monkeypatch, "_cursor_missing_required")
+
+
+def test_unrelated_constructor_typeerror_propagates(launch, monkeypatch):
+    class BrokenResult:
+        def __init__(self, **kwargs): raise TypeError("unrelated constructor failure")
+    monkeypatch.setattr(launch.a, "CodingAgentLaunchResult", BrokenResult)
+    with pytest.raises(TypeError, match="unrelated constructor failure"):
+        launch(mode="ask")
+
+
+@pytest.mark.parametrize("cancelled,timed_out", [(True,False), (False,True), (True,True)])
+@pytest.mark.parametrize("session", ["", "prior-session"])
+def test_terminal_precedence_no_replay_and_metadata(launch, session, cancelled, timed_out):
+    launch.stream.insert(0, {"type":"tool_call", "call_id":"synthetic-tool", "name":"ducky_get_tools", "status":"running", "args":{}})
+    launch.proc = ProcResult(returncode=3, stderr_tail=launch.a._SESSION_RESET, cancelled=cancelled, timed_out=timed_out)
+    result = launch(session)
+    assert not result.ok and result.status == ("cancelled" if cancelled else "timeout")
+    assert result.upstream_session_id == (session or "new-session")
+    assert result.reply_text == "legitimate reply" and result.blocks
+    assert (result.requested_mode, result.effective_mode) == ("agent", "")
+    assert len(launch.records) == 1
+    assert not list(launch.config.parent.glob("cursor-sdk-*.json"))
+
+
+def test_typed_reset_then_next_turn_fresh_and_generic_error_retains(launch):
+    launch.proc = ProcResult(returncode=3, stderr_tail=launch.a._SESSION_RESET)
+    first = launch("prior-session")
+    assert not first.ok and first.upstream_session_id == ""
+    launch.proc = ProcResult(returncode=0)
+    second = launch(first.upstream_session_id)
+    assert second.ok and second.effective_mode == "agent"
+    assert [r["agentId"] for r in launch.records] == ["prior-session", ""]
+    launch.proc = ProcResult(returncode=1, stderr_tail="expired not found network")
+    third = launch(second.upstream_session_id)
+    assert not third.ok and third.upstream_session_id == second.upstream_session_id
+    assert third.reply_text == "legitimate reply" and third.effective_mode == ""
+
+
+def test_usage_and_blocks_preserved(launch):
+    launch.stream[0:0] = [
+        {"type":"tool_call", "call_id":"synthetic-tool", "name":"ducky_get_tools", "status":"running", "args":{}},
+        {"type":"tool_call", "call_id":"synthetic-tool", "name":"ducky_get_tools", "status":"completed", "result":"synthetic catalog"},
+    ]
+    launch.stream[-1]["usage"] = {"input_tokens":12,"output_tokens":3,"model":"auto"}
+    result = launch()
+    assert result.ok and result.usage["input_tokens"] == 12 and result.usage["output_tokens"] == 3
+    assert result.blocks and result.reply_text == "legitimate reply"
+    assert (result.requested_mode, result.effective_mode) == ("agent", "agent")
+
+
+@pytest.mark.parametrize("exception", [GeneratorExit(), SystemExit(), KeyboardInterrupt()])
+def test_control_flow_unchanged(launch, monkeypatch, exception):
+    def fail(*args, **kwargs): raise exception
+    monkeypatch.setattr(launch.a, "run_streaming_process", fail)
+    with pytest.raises(type(exception)) as caught: launch()
+    assert caught.value is exception
+    assert not list(launch.config.parent.glob("cursor-sdk-*.json"))
+
+
+def test_capability_constructor_errors_not_masked(monkeypatch):
+    class Broken:
+        def __init__(self, *, supported_modes=(), **kwargs): raise TypeError("unrelated caps failure")
+    monkeypatch.setattr(base, "CodingAgentCapabilities", Broken)
+    with pytest.raises(TypeError, match="unrelated caps failure"):
+        load_adapter(monkeypatch, "_cursor_broken_caps")
+

@@ -8,11 +8,13 @@ only stores the upstream ``agentId`` and passes it back on the next turn.
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -44,6 +46,31 @@ _SDK_SETUP_ERROR = (
 )
 _SDK_RUN_ERROR = "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry."
 _SESSION_RESET = "Cursor session not found in this workspace. It cannot be resumed here; the next turn will start fresh."
+
+
+def _mode_keywords(constructor, **values):
+    """Optional host fields only; **kwargs alone does not certify support."""
+    parameters = inspect.signature(constructor).parameters
+    return {name: value for name, value in values.items() if name in parameters and
+            parameters[name].kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                      inspect.Parameter.KEYWORD_ONLY)}
+
+
+def _requested_mode(mode):
+    # Same strict contract as core; local to support published pre-mode hosts.
+    if mode is None or (isinstance(mode, str) and mode == ""):
+        return "agent"
+    if isinstance(mode, str) and mode.strip().lower() in ("agent", "ask", "plan"):
+        return mode.strip().lower()
+    return ""
+
+
+def _mode_result(result, requested):
+    fields = _mode_keywords(type(result), requested_mode=requested,
+                           effective_mode="agent" if requested == "agent" and result.ok
+                           and result.status == "done" else "")
+    # Keep the actual host dataclass identity and its serialization contract.
+    return replace(result, **fields) if fields else result
 
 
 def _read_ducky_mcp_config(path: str) -> dict[str, Any]:
@@ -1252,6 +1279,7 @@ class CursorAdapter:
         needs_api_key=True,
         needs_cli=False,
         resume=True,
+        **_mode_keywords(CodingAgentCapabilities, supported_modes=("agent",)),
     )
 
     def detect(self, settings: Any) -> CodingAgentInfo:
@@ -1474,6 +1502,48 @@ class CursorAdapter:
         cancel: Any = None,
         timeout_s: float = 0.0,
         image_paths: list[str] | None = None,
+        mode: str | None = "agent",
+    ) -> CodingAgentLaunchResult:
+        requested = _requested_mode(mode)
+        # Refusal precedes cancellation and all config/key/profile/setup effects.
+        if requested != "agent":
+            error = ("Cursor does not support Ask or Plan mode. Select Agent to run."
+                     if requested else "Invalid coding-agent mode; expected ask, plan or agent.")
+            return _mode_result(CodingAgentLaunchResult(
+                ok=False, status="error", error=error, upstream_session_id=session_id,
+            ), requested)
+
+        def mode_push(event):
+            # Streaming cannot establish a completed effective mode. Never trust
+            # event-supplied mode fields or mutate the producer's event object.
+            push({**event, "requested_mode": requested, "effective_mode": ""})
+
+        result = self._launch_agent(
+            prompt=prompt, system_prompt=system_prompt, cwd=cwd, conv_id=conv_id,
+            model=model, mcp_config_path=mcp_config_path, extra_args=extra_args,
+            cli_path=cli_path, env=env, push=mode_push, session_id=session_id,
+            run_id=run_id, cancel=cancel, timeout_s=timeout_s, image_paths=image_paths,
+        )
+        return _mode_result(result, requested)
+
+    def _launch_agent(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str,
+        cwd: str,
+        conv_id: str,
+        model: str,
+        mcp_config_path: str,
+        extra_args: str,
+        cli_path: str,
+        env: dict[str, str],
+        push: Any,
+        session_id: str = "",
+        run_id: str = "",
+        cancel: Any = None,
+        timeout_s: float = 0.0,
+        image_paths: list[str] | None = None,
     ) -> CodingAgentLaunchResult:
         preflight = _ducky_preflight(mcp_config_path, session_id, cancel)
         if isinstance(preflight, CodingAgentLaunchResult):
@@ -1524,6 +1594,7 @@ class CursorAdapter:
                     "(e.g. Composer 2.5) for this chat or Ducky profile."
                 ),
                 status="error",
+                upstream_session_id=session_id,
             )
         if model_id.lower() == "default":
             model_id = "auto"
