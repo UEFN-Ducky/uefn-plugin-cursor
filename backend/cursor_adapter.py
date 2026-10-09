@@ -15,6 +15,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from backend.agent.coding_agents.base import (
     CodingAgentCapabilities,
@@ -22,7 +23,6 @@ from backend.agent.coding_agents.base import (
     CodingAgentLaunchResult,
     which_cli,
 )
-from backend.agent.coding_agents.cli_pty import run_cli_in_terminal
 from backend.agent.coding_agents.mcp_inject import coding_agents_tmp_dir
 from backend.agent.coding_agents.proc_exec import run_streaming_process
 from backend.agent.coding_agents.settings_helpers import coding_agent_cfg
@@ -33,6 +33,78 @@ from .cursor_effort import (
     sdk_param_map,
 )
 from .cursor_tool_unwrap import unwrap_cursor_tool
+
+
+def _read_ducky_mcp_config(path: str) -> dict[str, Any]:
+    """Validate config, not connectivity; the SDK has no public pre-send catalog API."""
+    if not path or not path.strip():
+        raise ValueError
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers"), dict):
+        raise ValueError
+    servers = data["mcpServers"]
+    server = servers.get("uefn")
+    if not isinstance(server, dict):
+        raise ValueError
+    # @cursor/sdk McpServerConfig permits an omitted type for either transport.
+    transport = server.get("type", "http" if "url" in server else "stdio")
+    if transport == "stdio":
+        command, args = server.get("command"), server.get("args", [])
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError
+        if "cwd" in server and not isinstance(server["cwd"], str):
+            raise ValueError
+        mapping = server.get("env", {})
+    elif transport in ("http", "sse"):
+        url = server.get("url")
+        if not isinstance(url, str):
+            raise ValueError
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError
+        mapping = server.get("headers", {})
+        if "auth" in server:
+            auth = server["auth"]
+            if not isinstance(auth, dict) or not isinstance(auth.get("CLIENT_ID"), str):
+                raise ValueError
+            if "CLIENT_SECRET" in auth and not isinstance(auth["CLIENT_SECRET"], str):
+                raise ValueError
+            scopes = auth.get("scopes", [])
+            if not isinstance(scopes, list) or not all(isinstance(scope, str) for scope in scopes):
+                raise ValueError
+    else:
+        raise ValueError
+    if not isinstance(mapping, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in mapping.items()
+    ):
+        raise ValueError
+    return servers
+
+
+def _ducky_preflight(
+    path: str, session_id: str, cancel: threading.Event | None,
+) -> dict[str, Any] | CodingAgentLaunchResult:
+    if cancel is not None and cancel.is_set():
+        return CodingAgentLaunchResult(
+            ok=False, status="cancelled", error="Cancelled", upstream_session_id=session_id,
+        )
+    try:
+        servers = _read_ducky_mcp_config(path)
+    except Exception:
+        # Filesystem/schema errors can carry secrets. Never catch BaseException.
+        servers = None
+    if cancel is not None and cancel.is_set():
+        return CodingAgentLaunchResult(
+            ok=False, status="cancelled", error="Cancelled", upstream_session_id=session_id,
+        )
+    if servers is None:
+        return CodingAgentLaunchResult(
+            ok=False, status="error", upstream_session_id=session_id,
+            error="Ducky tools unavailable: invalid or unreadable MCP configuration. Check the Ducky MCP setup.",
+        )
+    return servers
 
 # #region agent log
 def _dbg_tool_pairing(message: str, data: dict[str, Any]) -> None:
@@ -156,7 +228,7 @@ async function loadSdk() {
   try {
     return await import("@cursor/sdk");
   } catch (e) {
-    console.error("SDK_UNAVAILABLE:" + (e && e.message ? e.message : e));
+    console.error("SDK_UNAVAILABLE");
     process.exit(2);
   }
 }
@@ -171,10 +243,11 @@ async function main() {
     return;
   }
 
-  const mcpServers =
-    cfg.mcpServers && Object.keys(cfg.mcpServers).length > 0
-      ? cfg.mcpServers
-      : undefined;
+  const mcpServers = cfg.mcpServers;
+  if (!mcpServers || typeof mcpServers !== "object" || !mcpServers.uefn) {
+    console.error("Ducky tools unavailable: required uefn configuration is missing.");
+    process.exit(1);
+  }
   const modelSel =
     Array.isArray(cfg.modelParams) && cfg.modelParams.length
       ? { id: cfg.model, params: cfg.modelParams }
@@ -191,14 +264,18 @@ async function main() {
       });
       resumed = true;
     } catch (e) {
-      emit({
-        type: "status",
-        text:
-          "Cursor session expired — starting a fresh agent (" +
-          String(e && e.message ? e.message : e) +
-          ")",
-      });
-      agent = null;
+      if (e && e.name === "AbortError") {
+        console.error("CURSOR_CANCELLED");
+        process.exit(1);
+      }
+      // Missing under this workspace is not proof of expiry. Never replay a
+      // resumed task in a new agent, nor classify failures from message text.
+      const missing = typeof sdk.AgentNotFoundError === "function" &&
+        e instanceof sdk.AgentNotFoundError;
+      console.error(missing
+        ? "Cursor session not found. Check the workspace or start a new chat."
+        : "Cursor session could not resume. Check SDK connectivity and authentication.");
+      process.exit(1);
     }
   }
 
@@ -385,8 +462,11 @@ async function main() {
 }
 
 main().catch((e) => {
-  const name = e && e.name && e.name !== "Error" ? e.name + ": " : "";
-  console.error("CURSOR_RUN_FAILED: " + name + String(e && e.message ? e.message : e));
+  if (e && e.name === "AbortError") {
+    console.error("CURSOR_CANCELLED");
+    process.exit(1);
+  }
+  console.error("Cursor SDK request failed. Check SDK connectivity and configuration.");
   process.exit(1);
 });
 """
@@ -1229,22 +1309,28 @@ class CursorAdapter:
         env: dict[str, str] | None = None,
     ) -> CodingAgentLaunchResult | None:
         """Run Cursor via @cursor/sdk with live NDJSON streaming into ``push``."""
+        # Keep this guard for direct callers as well as public launch().
+        mcp_servers = _ducky_preflight(mcp_config_path, session_id, cancel)
+        if isinstance(mcp_servers, CodingAgentLaunchResult):
+            return mcp_servers
         if not api_key:
             return None
-        node = which_cli("node") or which_cli("node.exe")
-        if not node:
-            return None
-        sandbox, _installed = _cursor_sdk_sandbox()
+        try:
+            node = which_cli("node") or which_cli("node.exe")
+            if not node:
+                return None
+            sandbox, _installed = _cursor_sdk_sandbox()
+        except Exception:
+            return CodingAgentLaunchResult(
+                ok=False, status="error", upstream_session_id=session_id,
+                error="Ducky tools unavailable: Cursor SDK setup failed. Check the SDK setup.",
+            )
+        if cancel is not None and cancel.is_set():
+            return CodingAgentLaunchResult(
+                ok=False, status="cancelled", error="Cancelled", upstream_session_id=session_id,
+            )
         if sandbox is None:
             return None
-
-        mcp_servers: dict[str, Any] = {}
-        if mcp_config_path:
-            try:
-                data = json.loads(Path(mcp_config_path).read_text(encoding="utf-8"))
-                mcp_servers = data.get("mcpServers") or {}
-            except (OSError, json.JSONDecodeError):
-                mcp_servers = {}
 
         effort = str((env or {}).get("DUCKY_THINKING_EFFORT") or "").strip()
         params = model_params(_cached_model_row(model), effort)
@@ -1282,11 +1368,12 @@ class CursorAdapter:
                 timeout_s=timeout_s,
                 cancel=cancel,
             )
-        except OSError as exc:
+        except Exception:
             return CodingAgentLaunchResult(
                 ok=False,
-                error=f"Cursor SDK launch failed: {exc}",
+                error="Ducky tools unavailable: Cursor SDK could not launch. Check the SDK setup.",
                 status="error",
+                upstream_session_id=session_id,
             )
         finally:
             if cfg_path is not None:
@@ -1303,10 +1390,7 @@ class CursorAdapter:
         new_session = state.agent_id or session_id
         err_tail = _strip_node_noise(proc.stderr_tail or "")
 
-        if proc.returncode == 2 or "SDK_UNAVAILABLE" in (proc.stderr_tail or ""):
-            return None
-
-        if proc.cancelled:
+        if proc.cancelled or err_tail.strip() == "CURSOR_CANCELLED":
             return CodingAgentLaunchResult(
                 ok=False,
                 upstream_session_id=new_session,
@@ -1327,6 +1411,9 @@ class CursorAdapter:
                 blocks=blocks,
             )
 
+        if proc.returncode == 2 or "SDK_UNAVAILABLE" in (proc.stderr_tail or ""):
+            return None
+
         if state.is_error or (proc.returncode != 0 and not reply and not blocks):
             err = state.error_text or err_tail or proc.raw_tail or "Cursor SDK failed (no reply captured)"
             low = err.lower()
@@ -1340,11 +1427,8 @@ class CursorAdapter:
                     "\nYour Cursor plan has no usage left for this model — pick "
                     "'Auto' in the model dropdown or raise limits at cursor.com/dashboard."
                 )
-            # Stale resume id — drop so the next turn creates a fresh agent.
-            if session_id and (
-                "not found" in low or "no such agent" in low or "expired" in low or "unknown agent" in low
-            ):
-                new_session = ""
+            # Preserve the handle on errors. Text such as "not found" may refer
+            # to a tool/config/network resource, not an expired conversation.
             return CodingAgentLaunchResult(
                 ok=False,
                 upstream_session_id=new_session,
@@ -1386,9 +1470,20 @@ class CursorAdapter:
         timeout_s: float = 0.0,
         image_paths: list[str] | None = None,
     ) -> CodingAgentLaunchResult:
+        preflight = _ducky_preflight(mcp_config_path, session_id, cancel)
+        if isinstance(preflight, CodingAgentLaunchResult):
+            return preflight
         from backend.agent.secrets import get_key
 
         api_key = get_key("cursor") or ""
+        if not api_key:
+            return CodingAgentLaunchResult(
+                ok=False, status="error", upstream_session_id=session_id,
+                error=(
+                    "Ducky tools unavailable: configure a Cursor API key in Settings to use the SDK. "
+                    "The terminal route cannot preserve Ducky MCP configuration and session."
+                ),
+            )
         # With resume, the agent keeps memory — only prepend the bootstrap system
         # prompt on the first turn (no session yet). Follow-ups send the user text.
         full_prompt = prompt
@@ -1445,52 +1540,10 @@ class CursorAdapter:
         if sdk is not None:
             return sdk
 
-        # With an API key, stay on the SDK path — do not open a PowerShell
-        # terminal fallback (that is what produced blank console windows).
-        if api_key:
-            return CodingAgentLaunchResult(
-                ok=False,
-                error=(
-                    "Cursor SDK could not start: Node.js 22.13+ and npm must be on PATH "
-                    "so the panel can install @cursor/sdk. Install Node, then retry."
-                ),
-                status="error",
-            )
-
-        binary = which_cli("cursor-agent", cli_path) or which_cli("agent", cli_path)
-        if not binary:
-            return CodingAgentLaunchResult(
-                ok=False,
-                error="Cursor SDK unavailable and cursor-agent CLI not found",
-                status="error",
-            )
-        argv = [binary]
-        extra = (extra_args or "").strip()
-        if extra:
-            import shlex
-
-            argv.extend(shlex.split(extra, posix=False))
-        # Never put multi-KB pastes on Windows argv (WinError 206).
-        launch_prompt = full_prompt
-        if len(full_prompt) > 2500:
-            from backend.agent.coding_agents.mcp_inject import write_prompt_file
-
-            prompt_file = write_prompt_file(full_prompt, conv_id=conv_id)
-            launch_prompt = (
-                "Open this UTF-8 file and follow every instruction in it exactly "
-                f"(do not summarize first): {prompt_file}"
-            )
-        argv.append(launch_prompt)
-        launch_env = dict(env)
-        if api_key:
-            launch_env["CURSOR_API_KEY"] = api_key
-        return run_cli_in_terminal(
-            argv=argv,
-            cwd=cwd,
-            conv_id=conv_id,
-            title="Cursor Agent",
-            env=launch_env,
-            push=push,
-            timeout_s=0.0,
-            skip_approval=True,
+        return CodingAgentLaunchResult(
+            ok=False, status="error", upstream_session_id=session_id,
+            error=(
+                "Ducky tools unavailable: Cursor SDK could not start. "
+                "Check Node.js 22.13+, npm, and the Cursor SDK setup."
+            ),
         )
