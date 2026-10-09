@@ -299,7 +299,17 @@ def native_launch(tmp_path, monkeypatch, launch):
 export class AgentNotFoundError extends Error {}
 const trace=(name,options)=>console.log(JSON.stringify({type:"trace",name,cwd:options?.local?.cwd}));
 const agent={agentId:"new-session",close(){},async send(){trace("send");return {
- async *stream(){},async wait(){return process.env.CURSOR_FIX_CASE === "result_error"
+ async *stream(){
+  const kind=process.env.CURSOR_FIX_CASE;
+  if(kind==="partial_text_throw") {
+   yield {type:"assistant",message:{content:[{type:"text",text:"legitimate partial answer"}]}};
+   throw Error("SYNTHETIC_SENSITIVE_MARKER");
+  }
+  if(kind==="partial_tool_throw") {
+   yield {type:"tool_call",call_id:"partial-tool",name:"ducky_get_tools",status:"running",args:{query:"test"}};
+   throw Error("SYNTHETIC_SENSITIVE_MARKER");
+  }
+ },async wait(){return process.env.CURSOR_FIX_CASE === "result_error"
  ? {status:"error",error:{message:"SYNTHETIC_SENSITIVE_MARKER",code:"ERROR"}}
  : {status:"finished",result:"legitimate answer"}}}}};
 export const Agent={
@@ -510,3 +520,55 @@ def test_structured_status_preserved_and_sanitized(native_launch, monkeypatch, s
     assert not result.ok and result.status == status
     assert result.upstream_session_id == "original-session"
     assert MARKER not in repr(result) + repr(native_launch.events)
+
+
+@pytest.mark.parametrize("session", ["", "original-session"])
+@pytest.mark.parametrize("case", ["partial_text_throw", "partial_tool_throw"])
+def test_nonzero_after_partial_stream_is_failure_with_content_retained(native_launch, monkeypatch, session, case):
+    monkeypatch.setenv("CURSOR_FIX_CASE", case)
+    result = native_launch(session)
+    assert len(native_launch.records) == 1
+    process = native_launch.records[0]
+    assert process.returncode == 1
+    assert not result.ok and result.status == "error"
+    assert result.error == adapter._SDK_RUN_ERROR
+    assert result.upstream_session_id == "new-session"
+    assert MARKER not in repr(result) + repr(native_launch.events) + process.stdout + process.stderr
+    traces = [json.loads(line)["name"] for line in process.stdout.splitlines()
+              if json.loads(line).get("type") == "trace"]
+    assert traces == (["resume", "send"] if session else ["create", "send"])
+    if case == "partial_text_throw":
+        assert "legitimate partial answer" in result.reply_text
+    else:
+        assert "ducky_get_tools" in repr(result.blocks)
+        assert "partial-tool" in repr(result.blocks)
+
+
+@pytest.mark.parametrize("session", ["", "original-session"])
+def test_exit_zero_success_still_preserves_answer(native_launch, monkeypatch, session):
+    monkeypatch.setenv("CURSOR_FIX_CASE", "success")
+    result = native_launch(session)
+    assert result.ok and result.status == "done" and not result.error
+    assert result.reply_text == "legitimate answer"
+    assert result.upstream_session_id == "new-session"
+    assert native_launch.records[0].returncode == 0
+
+
+@pytest.mark.parametrize("cancelled,timed_out,code,diagnostic,status,session", [
+    (True, True, 3, adapter._SESSION_RESET, "cancelled", "original-session"),
+    (False, True, 3, adapter._SESSION_RESET, "timeout", "original-session"),
+    (False, False, 3, adapter._SESSION_RESET, "error", ""),
+    (False, False, 1, "expired not found", "error", "original-session"),
+])
+def test_partial_content_does_not_change_terminal_precedence(native_launch, monkeypatch, cancelled, timed_out, code, diagnostic, status, session):
+    from backend.agent.coding_agents.proc_exec import ProcResult
+    def process(**kw):
+        kw["on_line"](json.dumps({"type":"text_delta", "text":"legitimate partial answer"}))
+        return ProcResult(returncode=code, stderr_tail=diagnostic,
+                          cancelled=cancelled, timed_out=timed_out)
+    monkeypatch.setattr(adapter, "run_streaming_process", process)
+    result = native_launch("original-session")
+    assert not result.ok and result.status == status
+    assert result.upstream_session_id == session
+    if status in ("cancelled", "timeout") or code == 1:
+        assert result.reply_text == "legitimate partial answer"

@@ -1428,7 +1428,9 @@ class CursorAdapter:
                 ok=False, status="error", upstream_session_id="", error=_SESSION_RESET,
             )
 
-        if state.is_error or (proc.returncode != 0 and not reply and not blocks):
+        # Partial answer/tool output is retained below, but never makes a
+        # failed process successful. Cancellation/timeout/reset take precedence.
+        if state.is_error or proc.returncode != 0:
             err = _SDK_RUN_ERROR
             # Preserve the handle on errors. Text such as "not found" may refer
             # to a tool/config/network resource, not an expired conversation.
