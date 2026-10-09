@@ -34,6 +34,17 @@ from .cursor_effort import (
 )
 from .cursor_tool_unwrap import unwrap_cursor_tool
 
+_NODE_REQUIRED = (
+    "Ducky tools unavailable: install Node.js 22.13+ and npm, make both available on PATH, "
+    "then retry so Ducky can set up the Cursor SDK."
+)
+_SDK_SETUP_ERROR = (
+    "Ducky tools unavailable: Cursor SDK setup failed. Ensure Node.js 22.13+ and npm are on PATH "
+    "and npm can access the package registry, then retry so Ducky can set up the SDK."
+)
+_SDK_RUN_ERROR = "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry."
+_SESSION_RESET = "Cursor session not found in this workspace. It cannot be resumed here; the next turn will start fresh."
+
 
 def _read_ducky_mcp_config(path: str) -> dict[str, Any]:
     """Validate config, not connectivity; the SDK has no public pre-send catalog API."""
@@ -260,6 +271,7 @@ async function main() {
       agent = await sdk.Agent.resume(cfg.agentId, {
         apiKey: cfg.apiKey,
         model: modelSel,
+        local: { cwd: cfg.cwd, settingSources: [] },
         mcpServers,
       });
       resumed = true;
@@ -273,9 +285,11 @@ async function main() {
       const missing = typeof sdk.AgentNotFoundError === "function" &&
         e instanceof sdk.AgentNotFoundError;
       console.error(missing
-        ? "Cursor session not found. Check the workspace or start a new chat."
+        ? "Cursor session not found in this workspace. It cannot be resumed here; the next turn will start fresh."
         : "Cursor session could not resume. Check SDK connectivity and authentication.");
-      process.exit(1);
+      // Dedicated exit status plus fixed diagnostic identifies this typed failure
+      // to Python. No task was sent; only the NEXT turn may create a new agent.
+      process.exit(missing ? 3 : 1);
     }
   }
 
@@ -417,7 +431,8 @@ async function main() {
   }
 
   const result = await run.wait();
-  const status = String((result && result.status) || "unknown");
+  const rawStatus = result && result.status;
+  const status = ["finished", "error", "cancelled", "timeout"].includes(rawStatus) ? rawStatus : "error";
   const text = String((result && result.result) || "");
   const err = result && result.error;
   const usage = (result && result.usage) || null;
@@ -432,7 +447,7 @@ async function main() {
     result: text,
     agentId,
     usage,
-    error: err && err.message ? { message: err.message, code: err.code || "" } : null,
+    error: err ? { message: "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry.", code: "CURSOR_RUN_FAILED" } : null,
   });
 
   try {
@@ -450,14 +465,7 @@ async function main() {
   if (status === "finished") {
     process.exit(0);
   }
-  if (err && err.message) {
-    const code = err.code ? "[" + err.code + "] " : "";
-    console.error("CURSOR_RUN_FAILED: " + code + err.message);
-  } else {
-    console.error(
-      "CURSOR_RUN_FAILED: run ended with status=" + status + " and no error detail",
-    );
-  }
+  console.error("CURSOR_RUN_FAILED");
   process.exit(1);
 }
 
@@ -874,10 +882,10 @@ class _CursorStreamState:
         err = data.get("error")
         if isinstance(err, dict) and err.get("message"):
             self.is_error = True
-            self.error_text = str(err.get("message") or "")
+            self.error_text = _SDK_RUN_ERROR
         elif self._done_status and self._done_status not in ("finished", "done", "success"):
             self.is_error = True
-            self.error_text = self.error_text or f"Cursor run ended with status={self._done_status}"
+            self.error_text = _SDK_RUN_ERROR
         usage = data.get("usage")
         if isinstance(usage, dict):
             # Billing from done.usage; context window from last step when present.
@@ -1259,26 +1267,21 @@ class CursorAdapter:
             # Key/CLI may still be fine — picker hides disabled agents; say why.
             status = "Disabled — turn on to use in chat"
             available = False
-        elif has_cursor_key:
+        elif not has_cursor_key:
+            status = "Add a Cursor API key in Settings to use the SDK. The Cursor IDE login alone is not sufficient."
+            available = False
+        elif not (which_cli("node") or which_cli("node.exe")):
+            status = _NODE_REQUIRED
+            available = False
+        else:
             from .cli_update import status_text
 
             status = "API key saved"
             extra = status_text()
-            if path:
-                status += f" · CLI: {path}"
+            status += " · Node found; Ducky sets up the SDK on first use (npm required)."
             if extra and extra not in status:
                 status += f" · {extra}"
             available = True
-        elif path:
-            status = f"CLI found (no API key): {path}"
-            available = True
-        else:
-            status = (
-                "Add a Cursor API key from cursor.com/dashboard/integrations — "
-                "not your Cursor IDE login. Node.js is required. "
-                "Optional fallback: install cursor-agent CLI."
-            )
-            available = False
         key = (get_key("cursor") or "") if has_cursor_key else ""
         return CodingAgentInfo(
             id=self.id,
@@ -1318,19 +1321,23 @@ class CursorAdapter:
         try:
             node = which_cli("node") or which_cli("node.exe")
             if not node:
-                return None
+                return CodingAgentLaunchResult(
+                    ok=False, status="error", upstream_session_id=session_id, error=_NODE_REQUIRED,
+                )
             sandbox, _installed = _cursor_sdk_sandbox()
         except Exception:
             return CodingAgentLaunchResult(
                 ok=False, status="error", upstream_session_id=session_id,
-                error="Ducky tools unavailable: Cursor SDK setup failed. Check the SDK setup.",
+                error=_SDK_SETUP_ERROR,
             )
         if cancel is not None and cancel.is_set():
             return CodingAgentLaunchResult(
                 ok=False, status="cancelled", error="Cancelled", upstream_session_id=session_id,
             )
         if sandbox is None:
-            return None
+            return CodingAgentLaunchResult(
+                ok=False, status="error", upstream_session_id=session_id, error=_SDK_SETUP_ERROR,
+            )
 
         effort = str((env or {}).get("DUCKY_THINKING_EFFORT") or "").strip()
         params = model_params(_cached_model_row(model), effort)
@@ -1371,7 +1378,7 @@ class CursorAdapter:
         except Exception:
             return CodingAgentLaunchResult(
                 ok=False,
-                error="Ducky tools unavailable: Cursor SDK could not launch. Check the SDK setup.",
+                error=_SDK_SETUP_ERROR,
                 status="error",
                 upstream_session_id=session_id,
             )
@@ -1390,7 +1397,7 @@ class CursorAdapter:
         new_session = state.agent_id or session_id
         err_tail = _strip_node_noise(proc.stderr_tail or "")
 
-        if proc.cancelled or err_tail.strip() == "CURSOR_CANCELLED":
+        if proc.cancelled or err_tail.strip() == "CURSOR_CANCELLED" or state._done_status == "cancelled":
             return CodingAgentLaunchResult(
                 ok=False,
                 upstream_session_id=new_session,
@@ -1400,7 +1407,7 @@ class CursorAdapter:
                 status="cancelled",
                 blocks=blocks,
             )
-        if proc.timed_out:
+        if proc.timed_out or state._done_status == "timeout":
             return CodingAgentLaunchResult(
                 ok=False,
                 upstream_session_id=new_session,
@@ -1414,19 +1421,15 @@ class CursorAdapter:
         if proc.returncode == 2 or "SDK_UNAVAILABLE" in (proc.stderr_tail or ""):
             return None
 
+        if proc.returncode == 3 and err_tail.strip() == _SESSION_RESET:
+            # Real core persists an explicitly empty result ID. Leave chat
+            # history intact, report once, then create only on the next turn.
+            return CodingAgentLaunchResult(
+                ok=False, status="error", upstream_session_id="", error=_SESSION_RESET,
+            )
+
         if state.is_error or (proc.returncode != 0 and not reply and not blocks):
-            err = state.error_text or err_tail or proc.raw_tail or "Cursor SDK failed (no reply captured)"
-            low = err.lower()
-            if "authenticationerror" in low or "unauthorized" in low or "api key" in low:
-                err += (
-                    "\nCheck the Cursor API key in Settings → LLMs → Coding Agents "
-                    "(create one at cursor.com/dashboard → Integrations)."
-                )
-            elif "out of usage" in low or "increase your limit" in low:
-                err += (
-                    "\nYour Cursor plan has no usage left for this model — pick "
-                    "'Auto' in the model dropdown or raise limits at cursor.com/dashboard."
-                )
+            err = _SDK_RUN_ERROR
             # Preserve the handle on errors. Text such as "not found" may refer
             # to a tool/config/network resource, not an expired conversation.
             return CodingAgentLaunchResult(
@@ -1436,7 +1439,7 @@ class CursorAdapter:
                 streamed=bool(streamed) or bool(blocks),
                 error=err,
                 status="error",
-                output_tail=err_tail,
+                output_tail=err,
                 blocks=blocks,
             )
 
@@ -1445,7 +1448,7 @@ class CursorAdapter:
             upstream_session_id=new_session,
             reply_text=reply,
             streamed=bool(streamed) or bool(blocks),
-            output_tail=reply or err_tail,
+            output_tail=reply,
             status="done",
             usage=state.usage,
             blocks=blocks,
@@ -1542,8 +1545,5 @@ class CursorAdapter:
 
         return CodingAgentLaunchResult(
             ok=False, status="error", upstream_session_id=session_id,
-            error=(
-                "Ducky tools unavailable: Cursor SDK could not start. "
-                "Check Node.js 22.13+, npm, and the Cursor SDK setup."
-            ),
+            error=_SDK_SETUP_ERROR,
         )
