@@ -298,7 +298,9 @@ def native_launch(tmp_path, monkeypatch, launch):
     (package / "index.js").write_text('''
 export class AgentNotFoundError extends Error {}
 const trace=(name,options)=>console.log(JSON.stringify({type:"trace",name,cwd:options?.local?.cwd}));
-const agent={agentId:"new-session",close(){},async send(){trace("send");return {
+const agent={agentId:"new-session",close(){},async send(){trace("send");
+ if(process.env.CURSOR_FIX_CASE==="mcp_send")throw Error("uefn MCP server unavailable SYNTHETIC_SENSITIVE_MARKER");
+ return {
  async *stream(){
   const kind=process.env.CURSOR_FIX_CASE;
   if(kind==="partial_text_throw") {
@@ -309,12 +311,16 @@ const agent={agentId:"new-session",close(){},async send(){trace("send");return {
    yield {type:"tool_call",call_id:"partial-tool",name:"ducky_get_tools",status:"running",args:{query:"test"}};
    throw Error("SYNTHETIC_SENSITIVE_MARKER");
   }
- },async wait(){return process.env.CURSOR_FIX_CASE === "result_error"
+ },async wait(){if(process.env.CURSOR_FIX_CASE==="mcp_result")return {status:"finished",result:"unsafe answer",error:{message:"uefn MCP server failed SYNTHETIC_SENSITIVE_MARKER"}};
+ return process.env.CURSOR_FIX_CASE === "result_error"
  ? {status:"error",error:{message:"SYNTHETIC_SENSITIVE_MARKER",code:"ERROR"}}
  : {status:"finished",result:"legitimate answer"}}}}};
 export const Agent={
- async create(options){trace("create",options);return agent},
+ async create(options){trace("create",options);
+ if(process.env.CURSOR_FIX_CASE==="mcp_create")throw Error("uefn MCP server unavailable SYNTHETIC_SENSITIVE_MARKER");
+ return agent},
  async resume(id,options){trace("resume",options);
+  if(process.env.CURSOR_FIX_CASE==="mcp_resume")throw Error("uefn MCP server unavailable SYNTHETIC_SENSITIVE_MARKER");
   if(process.env.CURSOR_FIX_CASE==="missing")throw new AgentNotFoundError("SYNTHETIC_SENSITIVE_MARKER");
   if(process.env.CURSOR_FIX_CASE==="network")throw Error("expired not found SYNTHETIC_SENSITIVE_MARKER");
   return agent}
@@ -572,3 +578,14 @@ def test_partial_content_does_not_change_terminal_precedence(native_launch, monk
     assert result.upstream_session_id == session
     if status in ("cancelled", "timeout") or code == 1:
         assert result.reply_text == "legitimate partial answer"
+
+
+@pytest.mark.parametrize("case,session", [("mcp_create", ""), ("mcp_resume", "original-session"),
+                                         ("mcp_send", ""), ("mcp_result", "original-session")])
+def test_native_runner_preserves_safe_ducky_connection_failure(native_launch, monkeypatch, case, session):
+    monkeypatch.setenv("CURSOR_FIX_CASE", case)
+    result = native_launch(session)
+    assert not result.ok and result.error == "Ducky's tools didn't connect"
+    assert not result.reply_text and not result.blocks
+    assert MARKER not in repr(result) + repr(native_launch.events)
+    assert all(MARKER not in p.stdout + p.stderr for p in native_launch.records)

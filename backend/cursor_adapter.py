@@ -11,6 +11,7 @@ import json
 import inspect
 import hashlib
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -168,6 +169,14 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
+function reportDuckyFailure(error) {
+  const text = String(error && (error.message || error) || "").toLowerCase();
+  if (/\buefn\b/.test(text) && /mcp|server|connect/.test(text) &&
+      /fail|unavailable|disconnect|not connected|could not|cannot|timed? ?out/.test(text)) {
+    emit({type: "error", error: "DUCKY_MCP_UNAVAILABLE"});
+  }
+}
+
 function parseArgsBlob(a) {
   if (a == null) return {};
   if (typeof a === "string") {
@@ -308,6 +317,7 @@ async function main() {
         console.error("CURSOR_CANCELLED");
         process.exit(1);
       }
+      reportDuckyFailure(e);
       // Missing under this workspace is not proof of expiry. Never replay a
       // resumed task in a new agent, nor classify failures from message text.
       const missing = typeof sdk.AgentNotFoundError === "function" &&
@@ -463,6 +473,7 @@ async function main() {
   const status = ["finished", "error", "cancelled", "timeout"].includes(rawStatus) ? rawStatus : "error";
   const text = String((result && result.result) || "");
   const err = result && result.error;
+  reportDuckyFailure(err);
   const usage = (result && result.usage) || null;
 
   if (text.trim() && assistantLen === 0) {
@@ -502,6 +513,7 @@ main().catch((e) => {
     console.error("CURSOR_CANCELLED");
     process.exit(1);
   }
+  reportDuckyFailure(e);
   console.error("Cursor SDK request failed. Check SDK connectivity and configuration.");
   process.exit(1);
 });
@@ -542,6 +554,29 @@ def _tool_result_to_text(content: Any) -> str:
     return text
 
 
+def _ducky_unavailable(event: dict[str, Any]) -> bool:
+    """Inspect connection metadata/errors, never ordinary assistant content."""
+    kind = event.get("type")
+    if kind in ("system", "meta") and "mcp_servers" in event:
+        servers = event["mcp_servers"]
+        if isinstance(servers, list):
+            return not any(isinstance(server, dict) and server.get("name") == "uefn"
+                           and server.get("status") == "connected" for server in servers)
+        return True
+    if kind not in ("error", "status", "result", "done"):
+        return False
+    values = [event.get("error", "")]
+    if event.get("is_error"):
+        values.append(event.get("result", ""))
+    if kind in ("error", "status"):
+        values.extend((event.get("message", ""), event.get("text", "")))
+    text = " ".join(str(value) for value in values).lower()
+    return ("ducky_mcp_unavailable" in text or
+            bool(re.search(r"\buefn\b", text) and
+                 re.search(r"mcp|server|connect", text) and
+                 re.search(r"fail|unavailable|disconnect|not connected|could not|cannot|timed? ?out", text)))
+
+
 class _CursorStreamState:
     """Accumulates Cursor SDK NDJSON events into panel pushes + persisted blocks."""
 
@@ -553,6 +588,7 @@ class _CursorStreamState:
         self.streamed_text: list[str] = []
         self.final_text = ""
         self.is_error = False
+        self.ducky_connection_failed = False
         self.error_text = ""
         self.saw_json = False
         self.usage: dict[str, Any] = {}
@@ -745,6 +781,9 @@ class _CursorStreamState:
         if not isinstance(data, dict):
             return
         self.saw_json = True
+        self.ducky_connection_failed |= _ducky_unavailable(data)
+        if self.ducky_connection_failed:
+            return
         kind = str(data.get("type") or "")
         if kind == "meta":
             aid = str(data.get("agentId") or "")
@@ -1470,6 +1509,10 @@ class CursorAdapter:
                 ok=False, status="error", upstream_session_id="", error=_SESSION_RESET,
             )
 
+        if state.ducky_connection_failed or _ducky_unavailable({"type": "error", "message": proc.stderr_tail}):
+            return CodingAgentLaunchResult(ok=False, status="error", upstream_session_id=new_session,
+                                           error="Ducky's tools didn't connect")
+
         # Partial answer/tool output is retained below, but never makes a
         # failed process successful. Cancellation/timeout/reset take precedence.
         if state.is_error or proc.returncode != 0:
@@ -1571,13 +1614,16 @@ class CursorAdapter:
             argv += ["--resume", session_id]
         argv += ["--", full_prompt]
         terminal = {}
+        connection_failed = False
         def on_line(line):
+            nonlocal connection_failed
             try:
                 event = json.loads(line)
             except (ValueError, TypeError):
                 return
             if not isinstance(event, dict):
                 return
+            connection_failed |= _ducky_unavailable(event)
             if event.get("session_id"):
                 terminal["session_id"] = event["session_id"]
             if event.get("type") == "result":
@@ -1608,12 +1654,16 @@ class CursorAdapter:
                     error = f"Cursor changed files in {mode.title()} mode: " + ", ".join(changed)
             except (OSError, subprocess.SubprocessError):
                 error = "Cursor could not verify the project's files after the run."
+        if proc is not None and not proc.cancelled and not proc.timed_out:
+            connection_failed |= _ducky_unavailable({"type": "error", "message": proc.stderr_tail})
+            if connection_failed and not error:
+                error = "Ducky's tools didn't connect"
         status = "error" if error else ("cancelled" if proc.cancelled else "timeout" if proc.timed_out else
                  "error" if proc.returncode or terminal.get("is_error") or terminal.get("type") != "result" else "done")
         if status != "done" and not error:
             error = {"cancelled": "Cancelled", "timeout": "Cursor CLI run timed out."}.get(status, "Cursor CLI run failed.")
         return CodingAgentLaunchResult(ok=status == "done", status=status, error=error,
-            reply_text=str(terminal.get("result") or ""),
+            reply_text="" if connection_failed else str(terminal.get("result") or ""),
             upstream_session_id=str(terminal.get("session_id") or session_id))
 
     def _launch_agent(

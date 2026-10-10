@@ -361,3 +361,63 @@ def test_missing_cli_is_actionable(launch, monkeypatch):
     monkeypatch.setattr(launch.a, "which_cli", lambda *a: None)
     result = launch(mode="ask")
     assert not result.ok and "agent CLI" in result.error and not launch.records
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask", "plan"])
+@pytest.mark.parametrize("session", ["", "prior-session"])
+@pytest.mark.parametrize("failure", [
+    {"type": "system", "subtype": "init", "mcp_servers": []},
+    {"type": "meta", "mcp_servers": [{"name": "uefn", "status": "failed"}]},
+    {"type": "error", "message": "MCP server uefn failed to connect PRIVATE_DETAIL"},
+    {"type": "result", "is_error": True, "result": "MCP server uefn failed to connect PRIVATE_DETAIL"},
+])
+def test_reported_ducky_failure_is_sticky(launch, monkeypatch, mode, session, failure):
+    def process(**kw):
+        kw["on_line"](json.dumps(failure))
+        return launch.process(**kw)
+    monkeypatch.setattr(launch.a, "run_streaming_process", process)
+    result = launch(session, mode=mode)
+    assert not result.ok and result.error == "Ducky's tools didn't connect"
+    assert not result.reply_text and not result.blocks
+    assert "PRIVATE_DETAIL" not in json.dumps(result.to_dict()) + json.dumps(launch.events)
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask", "plan"])
+def test_ducky_connection_failure_on_stderr(launch, mode):
+    launch.proc = ProcResult(returncode=1, stderr_tail="uefn MCP server unavailable PRIVATE_DETAIL")
+    result = launch(mode=mode)
+    assert not result.ok and result.error == "Ducky's tools didn't connect"
+    assert not result.reply_text
+
+
+@pytest.mark.parametrize("session", ["", "prior-session"])
+@pytest.mark.parametrize("mode", ["agent", "ask", "plan"])
+def test_cold_server_then_first_cursor_tool(launch, monkeypatch, session, mode):
+    from backend.agent.coding_agents import readiness
+    from backend.bridge import shared_mcp
+    now, tools = [0.0], []
+    monkeypatch.setattr(readiness.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(readiness.time, "sleep", lambda n: now.__setitem__(0, now[0]+n))
+    monkeypatch.setattr(shared_mcp, "start_daemon_from_app", lambda: {"ok": True})
+    monkeypatch.setattr(shared_mcp, "_daemon_answers", lambda **kw: now[0] >= 8)
+    def process(**kw):
+        assert now[0] == 8
+        if "-p" in kw["argv"]:
+            assert "--approve-mcps" in kw["argv"]
+            config = json.loads((Path(kw["env_extra"]["CURSOR_CONFIG_DIR"])/"mcp.json").read_text())
+        else:
+            config = json.loads(Path(kw["argv"][-1]).read_text())
+        assert "uefn" in config["mcpServers"]
+        # Simulated provider calls the configured server before its first answer.
+        assert shared_mcp._daemon_answers()
+        tools.append("ducky_get_plan")
+        kw["on_line"](json.dumps({"type": "system", "subtype": "init", "mcp_servers": [{"name": "uefn", "status": "connected"}]}))
+        return launch.process(**kw)
+    monkeypatch.setattr(launch.a, "run_streaming_process", process)
+    result = readiness.launch_with_ready_tools(types.SimpleNamespace(launch=lambda **kw: launch(session, mode=mode)))
+    assert result.ok and tools == ["ducky_get_plan"]
+
+
+def test_user_text_about_a_failure_is_not_connection_metadata(launch):
+    launch.stream.insert(0, {"type": "text_delta", "text": "Explain why uefn MCP server failed yesterday"})
+    assert launch().ok
