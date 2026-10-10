@@ -1,4 +1,4 @@
-"""Agent-only public contract; no SDK/provider invocation."""
+"""Mode routing and SDK compatibility without provider invocation."""
 import ast
 import dataclasses
 import importlib.util
@@ -44,6 +44,11 @@ def launch(monkeypatch, tmp_path):
     stream = [{"type": "text_delta", "text": "legitimate reply"}, {"type": "done", "status": "finished"}]
     proc = ProcResult(returncode=0)
     def process(**kw):
+        if "-p" in kw["argv"]:
+            records.append(kw)
+            kw["on_line"](json.dumps({"type":"result", "result":"legitimate reply", "session_id":
+                kw["argv"][kw["argv"].index("--resume")+1] if "--resume" in kw["argv"] else "new-session"}))
+            return invoke.proc
         cfg = json.loads(Path(kw["argv"][-1]).read_text())
         records.append(cfg)
         kw["on_line"](json.dumps({"type": "meta", "agentId": cfg["agentId"] or "new-session"}))
@@ -73,13 +78,13 @@ def launch(monkeypatch, tmp_path):
 def test_modes_and_metadata(launch, session, mode, canonical):
     result = launch(session, mode=mode)
     assert result.requested_mode == canonical
-    assert result.ok is (canonical == "agent")
-    assert result.effective_mode == ("agent" if result.ok else "")
+    assert result.ok is (canonical in ("agent", "ask", "plan"))
+    assert result.effective_mode == (canonical if result.ok else "")
     assert result.upstream_session_id == (session or "new-session") if result.ok else result.upstream_session_id == session
     assert len(launch.records) == int(result.ok)
 
 
-@pytest.mark.parametrize("mode", ["ask", "plan", "invalid", 7])
+@pytest.mark.parametrize("mode", ["invalid", 7])
 @pytest.mark.parametrize("cancelled", [False, True])
 @pytest.mark.parametrize("session", ["", "prior-session"])
 def test_refusal_precedes_every_side_effect(launch, monkeypatch, mode, cancelled, session):
@@ -101,15 +106,11 @@ def test_refusal_precedes_every_side_effect(launch, monkeypatch, mode, cancelled
 def test_core_refusal_and_six_turn_sequence(launch):
     session = ""
     for mode in ("agent", "ask", "plan", "agent", "plan", "ask"):
-        if mode != "agent":
-            with pytest.raises(ValueError, match="does not support"):
-                base.coding_mode_launch_kwargs(launch.instance, mode)
-            continue
         result = launch(session, **base.coding_mode_launch_kwargs(launch.instance, mode))
         assert result.ok
         session = result.upstream_session_id
-    assert [r["agentId"] for r in launch.records] == ["", "new-session"]
-    assert getattr(launch.instance.capabilities, "supported_modes") == ("agent",)
+    assert [r["agentId"] for r in launch.records if "agentId" in r] == ["", "new-session"]
+    assert getattr(launch.instance.capabilities, "supported_modes") == ("agent", "ask", "plan")
 
 
 @pytest.mark.parametrize("boundary", ["config", "key", "node", "setup", "model", "helper", "process", "cancel", "timeout", "error", "reset"])
@@ -216,15 +217,16 @@ def test_actual_host_loader_registration_mixed_hosts(launch, monkeypatch, histor
             assert (serialized["requested_mode"], serialized["effective_mode"]) == ("agent", "agent")
         else:
             assert not hasattr(result, "requested_mode") and not hasattr(result, "effective_mode")
-        assert getattr(instance.capabilities, "supported_modes", ("agent",)) == ("agent",)
+        assert getattr(instance.capabilities, "supported_modes", ("agent",)) == (("agent", "ask", "plan") if caps_new else ("agent",))
         for mode in ("ask", "plan"):
-            with pytest.raises(ValueError): base.coding_mode_launch_kwargs(instance, mode)
-            refused = launch(session, mode=mode)
-            assert not refused.ok and refused.upstream_session_id == session
+            if not caps_new:
+                with pytest.raises(ValueError): base.coding_mode_launch_kwargs(instance, mode)
+            result = launch(session, mode=mode)
+            assert result.ok
         # Real preflight uses precisely the same concrete class as its isinstance check.
         refused = launch(session, mcp_config_path="")
         assert type(refused) is legacy.CodingAgentLaunchResult and not refused.ok
-        assert len(launch.records) == 1
+        assert len(launch.records) == 3
     finally:
         for key in list(sys.modules):
             if key == name or key.startswith(name + "."):
@@ -238,7 +240,7 @@ def test_partial_result_shapes(launch, monkeypatch, historical_classes, field):
     for mode in ("agent", "ask"):
         result = launch("prior-session", mode=mode)
         assert type(result) is cls
-        assert getattr(result, field) == (mode if field == "requested_mode" else "agent" if result.ok else "")
+        assert getattr(result, field) == (mode if field == "requested_mode" else mode if result.ok else "")
 
 
 def test_kwargs_only_capabilities_are_conservative(monkeypatch):
@@ -320,3 +322,42 @@ def test_capability_constructor_errors_not_masked(monkeypatch):
     with pytest.raises(TypeError, match="unrelated caps failure"):
         load_adapter(monkeypatch, "_cursor_broken_caps")
 
+
+
+@pytest.mark.parametrize("mode", ["ask", "plan"])
+def test_readonly_argv_and_bridge(launch, mode):
+    result = launch(mode=mode, extra_args="--force --yolo -f --mode=agent")
+    assert result.ok and result.effective_mode == mode
+    call = launch.records[0]
+    argv = call["argv"]
+    assert f"--mode={mode}" in argv and "-p" in argv
+    assert argv[argv.index("--output-format")+1] == "stream-json"
+    assert not {"--force", "--yolo", "-f", "--mode=agent"} & set(argv)
+    assert ("ducky_create_plan" in argv[-1]) == (mode == "plan")
+    assert json.loads((Path(call["env_extra"]["CURSOR_CONFIG_DIR"]) / "mcp.json").read_text())["mcpServers"]["uefn"]["command"] == "mock-bridge"
+
+
+@pytest.mark.parametrize("mode", ["ask", "plan"])
+@pytest.mark.parametrize("mutation", ["edit", "delete", "add"])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel", "exception"])
+def test_file_change_always_fails(launch, monkeypatch, mode, mutation, outcome):
+    target = launch.config.parent / "project.txt"
+    target.write_text("before")
+    def process(**kw):
+        if mutation == "edit": target.write_text("changed content")
+        elif mutation == "delete": target.unlink()
+        else: (target.parent / "new.txt").write_text("new")
+        if outcome == "exception": raise RuntimeError("private")
+        launch.proc = ProcResult(returncode=int(outcome == "error"), cancelled=outcome == "cancel")
+        return launch.process(**kw)
+    monkeypatch.setattr(launch.a, "run_streaming_process", process)
+    result = launch(mode=mode)
+    assert not result.ok and result.status == "error" and result.effective_mode == ""
+    assert f"Cursor changed files in {mode.title()} mode:" in result.error
+    assert ("new.txt" if mutation == "add" else "project.txt") in result.error
+
+
+def test_missing_cli_is_actionable(launch, monkeypatch):
+    monkeypatch.setattr(launch.a, "which_cli", lambda *a: None)
+    result = launch(mode="ask")
+    assert not result.ok and "agent CLI" in result.error and not launch.records

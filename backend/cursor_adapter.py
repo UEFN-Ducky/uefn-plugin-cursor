@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -67,7 +68,7 @@ def _requested_mode(mode):
 
 def _mode_result(result, requested):
     fields = _mode_keywords(type(result), requested_mode=requested,
-                           effective_mode="agent" if requested == "agent" and result.ok
+                           effective_mode=requested if requested in ("agent", "ask", "plan") and result.ok
                            and result.status == "done" else "")
     # Keep the actual host dataclass identity and its serialization contract.
     return replace(result, **fields) if fields else result
@@ -1268,6 +1269,19 @@ def _known_models(api_key: str = "") -> list[dict[str, Any]]:
     return []
 
 
+def _project_snapshot(cwd):
+    """Track existing, added and removed project files; git metadata is excluded."""
+    root = Path(cwd)
+    snapshot = {}
+    for directory, dirs, files in os.walk(root, onerror=lambda error: (_ for _ in ()).throw(error)):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in files:
+            path = Path(directory) / name
+            stat = path.stat()
+            snapshot[path.relative_to(root).as_posix()] = (stat.st_size, stat.st_mtime_ns)
+    return snapshot
+
+
 class CursorAdapter:
     id = "cursor"
     label = "Cursor"
@@ -1279,7 +1293,7 @@ class CursorAdapter:
         needs_api_key=True,
         needs_cli=False,
         resume=True,
-        **_mode_keywords(CodingAgentCapabilities, supported_modes=("agent",)),
+        **_mode_keywords(CodingAgentCapabilities, supported_modes=("agent", "ask", "plan")),
     )
 
     def detect(self, settings: Any) -> CodingAgentInfo:
@@ -1505,12 +1519,10 @@ class CursorAdapter:
         mode: str | None = "agent",
     ) -> CodingAgentLaunchResult:
         requested = _requested_mode(mode)
-        # Refusal precedes cancellation and all config/key/profile/setup effects.
-        if requested != "agent":
-            error = ("Cursor does not support Ask or Plan mode. Select Agent to run."
-                     if requested else "Invalid coding-agent mode; expected ask, plan or agent.")
+        if not requested:
             return _mode_result(CodingAgentLaunchResult(
-                ok=False, status="error", error=error, upstream_session_id=session_id,
+                ok=False, status="error", error="Invalid coding-agent mode; expected ask, plan or agent.",
+                upstream_session_id=session_id,
             ), requested)
 
         def mode_push(event):
@@ -1518,6 +1530,13 @@ class CursorAdapter:
             # event-supplied mode fields or mutate the producer's event object.
             push({**event, "requested_mode": requested, "effective_mode": ""})
 
+        if requested in ("ask", "plan"):
+            return _mode_result(self._launch_readonly(
+                mode=requested, prompt=prompt, system_prompt=system_prompt, cwd=cwd,
+                conv_id=conv_id, model=model, mcp_config_path=mcp_config_path,
+                cli_path=cli_path, env=env, push=mode_push, session_id=session_id,
+                run_id=run_id, cancel=cancel, timeout_s=timeout_s, image_paths=image_paths,
+            ), requested)
         result = self._launch_agent(
             prompt=prompt, system_prompt=system_prompt, cwd=cwd, conv_id=conv_id,
             model=model, mcp_config_path=mcp_config_path, extra_args=extra_args,
@@ -1525,6 +1544,77 @@ class CursorAdapter:
             run_id=run_id, cancel=cancel, timeout_s=timeout_s, image_paths=image_paths,
         )
         return _mode_result(result, requested)
+
+    def _launch_readonly(self, *, mode, prompt, system_prompt, cwd, conv_id, model,
+                         mcp_config_path, cli_path, env, push, session_id, run_id,
+                         cancel, timeout_s, image_paths):
+        servers = _ducky_preflight(mcp_config_path, session_id, cancel)
+        if isinstance(servers, CodingAgentLaunchResult):
+            return servers
+        cli = which_cli("agent", cli_path) or which_cli("cursor-agent", cli_path)
+        if not cli:
+            return CodingAgentLaunchResult(ok=False, status="error", upstream_session_id=session_id,
+                error="Cursor Ask/Plan requires the Cursor agent CLI (agent or cursor-agent).")
+        from backend.agent.secrets import get_key
+        key = get_key("cursor") or ""
+        instruction = ("Plan only. Create the plan with Ducky's ducky_create_plan tool; do not edit project files."
+                       if mode == "plan" else "Answer only. Do not edit files or create a plan.")
+        full_prompt = instruction + "\n\n" + (system_prompt + "\n\n" if not session_id else "") + prompt
+        if image_paths:
+            full_prompt += "\nAttached images:\n" + "\n".join(image_paths)
+        # Use only adapter-owned arguments: saved flags must not override the mode.
+        argv = [cli, "-p", "--output-format", "stream-json", f"--mode={mode}",
+                "--trust", "--approve-mcps"]
+        if model:
+            argv += ["--model", "auto" if model == "default" else model]
+        if session_id:
+            argv += ["--resume", session_id]
+        argv += ["--", full_prompt]
+        terminal = {}
+        def on_line(line):
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                return
+            if not isinstance(event, dict):
+                return
+            if event.get("session_id"):
+                terminal["session_id"] = event["session_id"]
+            if event.get("type") == "result":
+                terminal.update(event)
+        try:
+            # Persistent per-chat config keeps CLI resumes and bridge identity isolated.
+            config = coding_agents_tmp_dir() / ("cursor-cli-" + hashlib.sha256(conv_id.encode()).hexdigest()[:24])
+            config.mkdir(parents=True, exist_ok=True)
+            (config / "mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+            before = _project_snapshot(cwd)
+        except (OSError, subprocess.SubprocessError):
+            return CodingAgentLaunchResult(ok=False, status="error", upstream_session_id=session_id,
+                error="Cursor could not prepare the read-only project snapshot or MCP configuration.")
+        proc = None
+        error = ""
+        try:
+            push({"type": "status", "text": f"Starting Cursor {mode.title()}?", "conv_id": conv_id, "run_id": run_id})
+            proc = run_streaming_process(argv=argv, cwd=cwd,
+                env_extra={**env, "CURSOR_CONFIG_DIR": str(config), "CURSOR_API_KEY": key},
+                conv_id=conv_id, on_line=on_line, timeout_s=timeout_s, cancel=cancel)
+        except Exception:
+            error = "Cursor CLI could not complete the run."
+        finally:
+            try:
+                after = _project_snapshot(cwd)
+                changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+                if changed:
+                    error = f"Cursor changed files in {mode.title()} mode: " + ", ".join(changed)
+            except (OSError, subprocess.SubprocessError):
+                error = "Cursor could not verify the project's files after the run."
+        status = "error" if error else ("cancelled" if proc.cancelled else "timeout" if proc.timed_out else
+                 "error" if proc.returncode or terminal.get("is_error") or terminal.get("type") != "result" else "done")
+        if status != "done" and not error:
+            error = {"cancelled": "Cancelled", "timeout": "Cursor CLI run timed out."}.get(status, "Cursor CLI run failed.")
+        return CodingAgentLaunchResult(ok=status == "done", status=status, error=error,
+            reply_text=str(terminal.get("result") or ""),
+            upstream_session_id=str(terminal.get("session_id") or session_id))
 
     def _launch_agent(
         self,
