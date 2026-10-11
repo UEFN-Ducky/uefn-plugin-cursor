@@ -165,6 +165,10 @@ def _dbg_tool_pairing(message: str, data: dict[str, Any]) -> None:
 _CURSOR_SDK_RUNNER = r"""
 import fs from "node:fs";
 
+// Cursor's own shell, edit, read, web and sub-agent tools are off: everything goes
+// through Ducky's MCP tools, so the person sees each command, edit and helper in Ducky.
+const DUCKY_ONLY_TOOLS = ["mcp"];
+
 function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
@@ -310,6 +314,8 @@ async function main() {
         model: modelSel,
         local: { cwd: cfg.cwd, settingSources: [] },
         mcpServers,
+        // Ducky's tools only (not persisted by the SDK: every resume passes it again).
+        tools: DUCKY_ONLY_TOOLS,
       });
       resumed = true;
     } catch (e) {
@@ -337,6 +343,7 @@ async function main() {
       model: modelSel,
       local: { cwd: cfg.cwd, settingSources: [] },
       mcpServers,
+      tools: DUCKY_ONLY_TOOLS,
     });
   }
 
@@ -1708,8 +1715,8 @@ class CursorAdapter:
         if images:
             listed = "\n".join(f"- {p}" for p in images)
             full_prompt += (
-                "\n\nThe user attached image file(s) with this message. Read these absolute "
-                f"paths to view them:\n{listed}"
+                "\n\nThe user attached image file(s) with this message. Look at each with "
+                f"Ducky's `view_image` tool (pass the absolute path):\n{listed}"
             )
         try:
             from frontend.ui_web.conversation_attachments import chat_attachments_dir
@@ -1720,7 +1727,7 @@ class CursorAdapter:
         if captures is not None:
             full_prompt += (
                 "\n\nUEFN Ducky screenshots for this chat are PNG files in this folder. "
-                f"Read them here:\n- {captures}"
+                f"Look at one with Ducky's `view_image` tool:\n- {captures}"
             )
 
         # A model must be selected explicitly. Cursor's advertised `default`

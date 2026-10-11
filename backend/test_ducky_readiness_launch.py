@@ -589,3 +589,30 @@ def test_native_runner_preserves_safe_ducky_connection_failure(native_launch, mo
     assert not result.reply_text and not result.blocks
     assert MARKER not in repr(result) + repr(native_launch.events)
     assert all(MARKER not in p.stdout + p.stderr for p in native_launch.records)
+
+
+@pytest.mark.parametrize("agent_id", ["", "previous"])
+def test_cursor_runs_with_ducky_tools_only(tmp_path, agent_id):
+    """Create and every resume (the SDK does not keep it) offer Ducky's MCP tools only."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    package = tmp_path / "node_modules/@cursor/sdk"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text('{"type":"module","exports":"./index.js"}', encoding="utf-8")
+    (package / "index.js").write_text('''
+export class AgentNotFoundError extends Error {}
+const seen=(name,o)=>console.log(JSON.stringify({type:"trace",name,tools:(o&&o.tools)||null}));
+const agent={agentId:"a1",close(){},async send(){return {async *stream(){},async wait(){return {status:"finished",result:"ok"}}}}};
+export const Agent={async create(o){seen("create",o);return agent},async resume(id,o){seen("resume",o);return agent}};
+''', encoding="utf-8")
+    runner = tmp_path / "runner.mjs"
+    runner.write_text(adapter._CURSOR_SDK_RUNNER, encoding="utf-8")
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(dict(cmd="prompt", model="auto", apiKey="k", cwd=str(tmp_path), prompt="hi",
+                                      mcpServers=VALID["mcpServers"], agentId=agent_id)), encoding="utf-8")
+    result = subprocess.run([node, str(runner), str(config)], cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    traces = [json.loads(line) for line in result.stdout.splitlines() if json.loads(line).get("type") == "trace"]
+    assert [t["name"] for t in traces] == (["resume"] if agent_id else ["create"])
+    assert traces[0]["tools"] == ["mcp"]
