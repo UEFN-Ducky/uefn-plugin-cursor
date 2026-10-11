@@ -1,10 +1,10 @@
 {
   "id": "cursor",
   "kind": "plugin",
-  "version": "1.0.35",
+  "version": "1.0.36",
   "label": "Cursor",
   "description": "Cursor API key + Cursor coding agent for Settings \u2192 LLMs. Install from Store \u2192 Gateways, then enable to show Cursor under Providers.",
-  "min_app_version": "1.2.380",
+  "min_app_version": "1.2.382",
   "default_enabled": true,
   "secret_keys": [
     "cursor"

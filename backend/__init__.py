@@ -139,6 +139,9 @@ def register(api) -> None:
         token_provider="cursor",
         login_status_ok="api key saved",
         shows_thinking_effort=True,
+        # Cursor works through Ducky's tools only, so Ducky's approval modes apply to it:
+        # Ducky asks before its file changes (Ask before changes) and its terminal commands.
+        chat_permission_modes=("ask", "edits", "all"),
     )
     api.register_ide_hookup("cursor", label="Cursor")
     try:
