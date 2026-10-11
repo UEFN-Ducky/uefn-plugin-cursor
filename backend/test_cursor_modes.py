@@ -25,7 +25,6 @@ def load_adapter(monkeypatch, name="_cursor_modes"):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "_dbg_tool_pairing", lambda *args, **kw: None)
     return module
 
 
@@ -202,7 +201,6 @@ def test_actual_host_loader_registration_mixed_hosts(launch, monkeypatch, histor
         package.register(api)
         instance = host.get_coding_agent_registration("cursor")["factory"]()
         module = sys.modules[name + ".cursor_adapter"]
-        monkeypatch.setattr(module, "_dbg_tool_pairing", lambda *args, **kw: None)
         assert module.CodingAgentLaunchResult is legacy.CodingAgentLaunchResult
         for attr in ("which_cli", "_cursor_sdk_sandbox", "_cached_model_row", "coding_agents_tmp_dir", "run_streaming_process"):
             monkeypatch.setattr(module, attr, getattr(launch.a, attr))
