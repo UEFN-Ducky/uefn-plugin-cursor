@@ -419,3 +419,36 @@ def test_cold_server_then_first_cursor_tool(launch, monkeypatch, session, mode):
 def test_user_text_about_a_failure_is_not_connection_metadata(launch):
     launch.stream.insert(0, {"type": "text_delta", "text": "Explain why uefn MCP server failed yesterday"})
     assert launch().ok
+
+
+@pytest.mark.parametrize("mode", ["ask", "plan", "agent"])
+def test_project_mcp_servers_are_disabled_before_cli_runs(launch, monkeypatch, mode):
+    # Epic's ModelContextProtocol.GenerateClientConfig writes .cursor/mcp.json with
+    # unreal-mcp; the CLI's --approve-mcps would load it next to Ducky's server.
+    project = launch.config.parent
+    (project / ".cursor").mkdir()
+    (project / ".cursor" / "mcp.json").write_text(json.dumps({"mcpServers": {
+        "unreal-mcp": {"url": "http://127.0.0.1:8000/mcp"}, "uefn": {"command": "stale"}}}))
+    calls = []
+    monkeypatch.setattr(launch.a.subprocess, "run",
+                        lambda argv, **kw: calls.append((argv, kw, len(launch.records))))
+    assert launch(mode=mode).ok
+    if mode == "agent":  # the SDK path loads no project settings (settingSources: [])
+        assert calls == []
+        return
+    assert [argv[1:] for argv, _kw, _runs in calls] == [["mcp", "disable", "unreal-mcp"]]
+    argv, kw, runs_before = calls[0]
+    assert runs_before == 0
+    assert kw["cwd"] == str(project)
+    assert kw["env"]["CURSOR_CONFIG_DIR"] == launch.records[0]["env_extra"]["CURSOR_CONFIG_DIR"]
+
+
+def test_project_mcp_servers_stop_at_the_home_folder(launch, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    game = home / "Games" / "MyGame"
+    for folder, servers in ((home, {"personal": {}}), (home / "Games", {"helper": {}, "uefn": {}}),
+                            (game, {"unreal-mcp": {}, "helper": {}})):
+        (folder / ".cursor").mkdir(parents=True)
+        (folder / ".cursor" / "mcp.json").write_text(json.dumps({"mcpServers": servers}))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    assert launch.a._project_mcp_servers(str(game)) == ["unreal-mcp", "helper"]

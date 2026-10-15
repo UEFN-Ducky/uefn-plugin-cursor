@@ -1278,6 +1278,48 @@ def _known_models(api_key: str = "") -> list[dict[str, Any]]:
     return []
 
 
+def _project_mcp_servers(cwd):
+    """Servers a project's own .cursor/mcp.json declares besides Ducky's ``uefn``.
+
+    The CLI finds these from the working folder up, and --approve-mcps would load them.
+    Epic's ModelContextProtocol.GenerateClientConfig writes one with ``unreal-mcp``: a
+    line to the editor past Ducky. The home folder and above hold Cursor's own global
+    config and are left alone.
+    """
+    names = []
+    try:
+        here = Path(cwd).resolve()
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return names
+    for folder in (here, *here.parents):
+        if folder == home or folder in home.parents:
+            break
+        try:
+            data = json.loads((folder / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        servers = data.get("mcpServers") if isinstance(data, dict) else None
+        for name in servers if isinstance(servers, dict) else ():
+            if name != "uefn" and name not in names:
+                names.append(str(name))
+    return names
+
+
+def _disable_project_mcps(cli, cwd, env):
+    """``agent mcp disable`` each of them in this chat's config dir before the run.
+
+    Disabled servers neither load nor ask for approval, --approve-mcps included.
+    """
+    for name in _project_mcp_servers(cwd):
+        try:
+            subprocess.run([cli, "mcp", "disable", name], cwd=cwd, env={**os.environ, **env},
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=20, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def _project_snapshot(cwd):
     """Track existing, added and removed project files; git metadata is excluded."""
     root = Path(cwd)
@@ -1603,6 +1645,8 @@ class CursorAdapter:
             config = coding_agents_tmp_dir() / ("cursor-cli-" + hashlib.sha256(conv_id.encode()).hexdigest()[:24])
             config.mkdir(parents=True, exist_ok=True)
             (config / "mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+            cli_env = {**env, "CURSOR_CONFIG_DIR": str(config), "CURSOR_API_KEY": key}
+            _disable_project_mcps(cli, cwd, cli_env)
             before = _project_snapshot(cwd)
         except (OSError, subprocess.SubprocessError):
             return CodingAgentLaunchResult(ok=False, status="error", upstream_session_id=session_id,
@@ -1611,8 +1655,7 @@ class CursorAdapter:
         error = ""
         try:
             push({"type": "status", "text": f"Starting Cursor {mode.title()}?", "conv_id": conv_id, "run_id": run_id})
-            proc = run_streaming_process(argv=argv, cwd=cwd,
-                env_extra={**env, "CURSOR_CONFIG_DIR": str(config), "CURSOR_API_KEY": key},
+            proc = run_streaming_process(argv=argv, cwd=cwd, env_extra=cli_env,
                 conv_id=conv_id, on_line=on_line, timeout_s=timeout_s, cancel=cancel)
         except Exception:
             error = "Cursor CLI could not complete the run."
