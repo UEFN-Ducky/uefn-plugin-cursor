@@ -361,8 +361,11 @@ def test_missing_session_recovers_next_turn_real_core_storage(native_launch, mon
             arg.annotation = None
     scope = {}
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), scope)
+    # The block that persists the session the launch returned (runner.py has other
+    # ``if adapter.capabilities.resume`` blocks before it).
     block = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
-                 and ast.unparse(n.test) == "adapter.capabilities.resume")
+                 and ast.unparse(n.test) == "adapter.capabilities.resume"
+                 and "store_session_id" in ast.unparse(n))
     conv = types.SimpleNamespace(upstream_session_id="cursor:original-session", messages=["history"])
     monkeypatch.setenv("CURSOR_FIX_CASE", "missing")
     first = native_launch(scope["read_session_id"](conv, "cursor"))

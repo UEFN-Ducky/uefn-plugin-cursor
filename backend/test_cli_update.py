@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 from cli_update import hidden_run_kwargs, npm_argv, plugin_package_version
@@ -32,7 +33,8 @@ def test_plugin_wires_sdk_refresh():
     assert "update_sdk" in updater
     assert "_cursor_sdk_sandbox" in updater
     assert "npm_argv" in adapter
-    assert plugin_package_version() == "1.0.33"
+    manifest = json.loads(Path(__file__).resolve().parents[1].joinpath("plugin.json").read_text(encoding="utf-8"))
+    assert plugin_package_version() == manifest["version"]
 
 
 if __name__ == "__main__":
