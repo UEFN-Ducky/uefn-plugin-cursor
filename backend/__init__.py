@@ -148,6 +148,7 @@ def register(api) -> None:
         account_login=cursor_accounts.account_login,
         account_status=cursor_accounts.account_status,
         account_logout=cursor_accounts.account_logout,
+        account_usage=cursor_accounts.account_usage,
         is_limit_error=is_limit_error,
     )
     api.register_ide_hookup("cursor", label="Cursor")

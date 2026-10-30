@@ -71,3 +71,14 @@ def account_status(config_dir: Any) -> dict[str, Any]:
 
 def account_logout(config_dir: Any) -> None:
     _run_cli(config_dir, "logout")
+
+
+def account_usage(config_dir: Any, **_kw: Any) -> list[dict[str, Any]]:
+    """Plan windows of one account: a key's rate-limit headers, a sign-in's usage summary."""
+    from .usage import account_session, fetch_usage
+
+    env = account_env(config_dir)
+    if ACCOUNT_DIR_ENV in env:
+        session = account_session(config_dir)
+        return fetch_usage("", session=session).get("windows") or [] if session else []
+    return fetch_usage(env.get("CURSOR_API_KEY") or "", session="").get("windows") or []

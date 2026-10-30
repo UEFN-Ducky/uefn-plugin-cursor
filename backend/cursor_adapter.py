@@ -54,6 +54,7 @@ ACCOUNT_DIR_ENV = "DUCKY_CURSOR_ACCOUNT_DIR"
 # ponytail: files the agent CLI keeps its sign-in in, copied into the chat's config folder
 # when newer; a token the CLI refreshes there isn't copied back (sign in again if it expires).
 ACCOUNT_AUTH_FILES = ("cli-config.json", "auth.json")
+_LIMIT_ERROR = "This Cursor account hit its usage limit. Add or pick another account, or wait for the reset."
 _LIMIT_RE = re.compile(
     r"usage limit|hit your (?:usage |rate )?limit|rate[ _-]?limit|quota|too many requests|\b429\b",
     re.IGNORECASE,
@@ -63,6 +64,22 @@ _LIMIT_RE = re.compile(
 def is_limit_error(text: str) -> bool:
     """Cursor's out-of-usage / rate-limit messages."""
     return bool(_LIMIT_RE.search(text or ""))
+
+
+def _next_account_env(env: dict[str, str]) -> dict[str, str] | None:
+    """Report the running account full; launch env for the next one, None if none is left."""
+    try:
+        from backend.agent import accounts
+
+        before = accounts.current_account("cursor")
+        accounts.report_limit("cursor", before)
+        extra = accounts.coding_agent_account_env("cursor")
+        if accounts.current_account("cursor") == before:
+            return None
+    except Exception:
+        return None
+    base = {k: v for k, v in env.items() if k not in ("CURSOR_API_KEY", ACCOUNT_DIR_ENV)}
+    return {**base, **extra}
 
 
 def _account_auth(env: dict[str, str] | None) -> tuple[str, str]:
@@ -613,6 +630,7 @@ class _CursorStreamState:
         self.is_error = False
         self.ducky_connection_failed = False
         self.error_text = ""
+        self.limit_hit = False
         self.saw_json = False
         self.usage: dict[str, Any] = {}
         # Last per-step window from intermediate usage events; done.usage may be
@@ -949,6 +967,7 @@ class _CursorStreamState:
         if isinstance(err, dict) and err.get("message"):
             self.is_error = True
             self.error_text = _SDK_RUN_ERROR
+            self.limit_hit = is_limit_error(str(err["message"]))
         elif self._done_status and self._done_status not in ("finished", "done", "success"):
             self.is_error = True
             self.error_text = _SDK_RUN_ERROR
@@ -1557,7 +1576,7 @@ class CursorAdapter:
         # Partial answer/tool output is retained below, but never makes a
         # failed process successful. Cancellation/timeout/reset take precedence.
         if state.is_error or proc.returncode != 0:
-            err = _SDK_RUN_ERROR
+            err = _LIMIT_ERROR if state.limit_hit or is_limit_error(err_tail) else _SDK_RUN_ERROR
             # Preserve the handle on errors. Text such as "not found" may refer
             # to a tool/config/network resource, not an expired conversation.
             return CodingAgentLaunchResult(
@@ -1614,19 +1633,30 @@ class CursorAdapter:
             # event-supplied mode fields or mutate the producer's event object.
             push({**event, "requested_mode": requested, "effective_mode": ""})
 
-        if requested in ("ask", "plan"):
-            return _mode_result(self._launch_readonly(
-                mode=requested, prompt=prompt, system_prompt=system_prompt, cwd=cwd,
-                conv_id=conv_id, model=model, mcp_config_path=mcp_config_path,
-                cli_path=cli_path, env=env, push=mode_push, session_id=session_id,
+        def run(run_env):
+            if requested in ("ask", "plan"):
+                return self._launch_readonly(
+                    mode=requested, prompt=prompt, system_prompt=system_prompt, cwd=cwd,
+                    conv_id=conv_id, model=model, mcp_config_path=mcp_config_path,
+                    cli_path=cli_path, env=run_env, push=mode_push, session_id=session_id,
+                    run_id=run_id, cancel=cancel, timeout_s=timeout_s, image_paths=image_paths,
+                )
+            return self._launch_agent(
+                prompt=prompt, system_prompt=system_prompt, cwd=cwd, conv_id=conv_id,
+                model=model, mcp_config_path=mcp_config_path, extra_args=extra_args,
+                cli_path=cli_path, env=run_env, push=mode_push, session_id=session_id,
                 run_id=run_id, cancel=cancel, timeout_s=timeout_s, image_paths=image_paths,
-            ), requested)
-        result = self._launch_agent(
-            prompt=prompt, system_prompt=system_prompt, cwd=cwd, conv_id=conv_id,
-            model=model, mcp_config_path=mcp_config_path, extra_args=extra_args,
-            cli_path=cli_path, env=env, push=mode_push, session_id=session_id,
-            run_id=run_id, cancel=cancel, timeout_s=timeout_s, image_paths=image_paths,
-        )
+            )
+
+        result = run(env)
+        # A limit hit before any output: mark the account full and run the turn once
+        # more on the next account (core's pick order).
+        if result.error == _LIMIT_ERROR and not result.streamed:
+            next_env = _next_account_env(env)
+            if next_env is not None:
+                push({"type": "status", "text": "Cursor account hit its limit; switching account…",
+                      "conv_id": conv_id, "run_id": run_id})
+                result = run(next_env)
         return _mode_result(result, requested)
 
     def _launch_readonly(self, *, mode, prompt, system_prompt, cwd, conv_id, model,
@@ -1706,6 +1736,9 @@ class CursorAdapter:
                 error = "Ducky's tools didn't connect"
         status = "error" if error else ("cancelled" if proc.cancelled else "timeout" if proc.timed_out else
                  "error" if proc.returncode or terminal.get("is_error") or terminal.get("type") != "result" else "done")
+        if status == "error" and not error and (is_limit_error(str(terminal.get("result") or ""))
+                                                or is_limit_error(proc.stderr_tail or "")):
+            error = _LIMIT_ERROR
         if status != "done" and not error:
             error = {"cancelled": "Cancelled", "timeout": "Cursor CLI run timed out."}.get(status, "Cursor CLI run failed.")
         return CodingAgentLaunchResult(ok=status == "done", status=status, error=error,

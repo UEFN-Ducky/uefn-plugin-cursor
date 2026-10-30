@@ -231,8 +231,30 @@ def _cursor_session() -> str:
         return ""
 
 
-def fetch_usage(api_key: str, *, model: str = "") -> dict[str, Any]:
-    session = _cursor_session()
+def _token_in(node: Any) -> str:
+    if isinstance(node, dict):
+        for k in ("accessToken", "access_token"):
+            if isinstance(node.get(k), str) and node[k].strip():
+                return node[k].strip()
+        return next((t for t in map(_token_in, node.values()) if t), "")
+    return ""
+
+
+def account_session(config_dir: Any) -> str:
+    """A CLI sign-in folder's access token, as the usage-summary cookie value."""
+    for name in ("auth.json", "cli-config.json"):
+        try:
+            token = _token_in(json.loads((Path(config_dir) / name).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        if token:
+            return session_cookie_from_token(token)
+    return ""
+
+
+def fetch_usage(api_key: str, *, model: str = "", session: str | None = None) -> dict[str, Any]:
+    """``session`` None = this PC's Cursor IDE sign-in; "" = key only."""
+    session = _cursor_session() if session is None else session
     if session:
         try:
             import httpx

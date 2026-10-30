@@ -495,6 +495,73 @@ def test_account_hooks(monkeypatch, tmp_path):
     assert p.parse_status("Not logged in") == {"loggedIn": False}
 
 
+@pytest.fixture
+def two_keys(launch, monkeypatch, tmp_path):
+    from backend.agent import accounts
+    hooks = importlib.import_module("_cursor_modes.cursor_accounts")
+    monkeypatch.setattr(accounts, "_data_root", lambda: tmp_path / "data")
+    monkeypatch.setattr(accounts, "_agent_reg", lambda _id: {"account_env": hooks.account_env})
+    monkeypatch.setattr(accounts, "account_key", lambda _p, aid: f"key-{aid}")
+    monkeypatch.setattr(accounts, "_CURRENT", {})
+    return accounts
+
+
+def _limit_once(launch, monkeypatch, mode):
+    hits = []
+    def process(**kw):
+        if hits:
+            return launch.process(**kw)
+        hits.append(1)
+        if "-p" in kw["argv"]:
+            launch.records.append(kw)
+            kw["on_line"](json.dumps({"type": "result", "is_error": True, "result": "You've hit your usage limit"}))
+        else:
+            launch.records.append(json.loads(Path(kw["argv"][-1]).read_text()))
+            kw["on_line"](json.dumps({"type": "done", "status": "error", "error": {"message": "You've hit your usage limit"}}))
+        return ProcResult(returncode=1)
+    monkeypatch.setattr(launch.a, "run_streaming_process", process)
+
+
+def _keys(launch, mode):
+    return [r["apiKey"] if mode == "agent" else r["env_extra"]["CURSOR_API_KEY"] for r in launch.records]
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask"])
+def test_limit_replays_once_on_the_next_key(launch, two_keys, monkeypatch, mode):
+    b = two_keys.add_account("cursor", "B", "key")
+    env = two_keys.coding_agent_account_env("cursor")  # runner: default account → {}
+    _limit_once(launch, monkeypatch, mode)
+    result = launch(mode=mode, env=env)
+    assert result.ok, result.error
+    assert _keys(launch, mode) == ["synthetic-key", f"key-{b}"]
+    assert two_keys.exhausted_until("cursor", "default") and two_keys.current_account("cursor") == b
+    assert any("switching account" in e.get("text", "") for e in launch.events)
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask"])
+def test_limit_with_no_other_account_reports_it(launch, two_keys, monkeypatch, mode):
+    two_keys.coding_agent_account_env("cursor")
+    _limit_once(launch, monkeypatch, mode)
+    result = launch(mode=mode, env={})
+    assert not result.ok and result.error == launch.a._LIMIT_ERROR and len(launch.records) == 1
+
+
+def test_account_usage(monkeypatch, tmp_path):
+    load_adapter(monkeypatch, "_cursor_usage")
+    usage = importlib.import_module("_cursor_usage.usage")
+    hooks = importlib.import_module("_cursor_usage.cursor_accounts")
+    (tmp_path / "auth.json").write_text(json.dumps({"tokens": {"accessToken": "jwt-token"}}))
+    assert usage.account_session(tmp_path) == "jwt-token"
+    assert usage.account_session(tmp_path / "missing") == ""
+    seen = []
+    monkeypatch.setattr(usage, "fetch_usage", lambda key, **kw: seen.append((key, kw)) or {"windows": [{"id": "plan"}]})
+    monkeypatch.setattr(hooks, "account_env", lambda d: {hooks.ACCOUNT_DIR_ENV: str(d)})
+    assert hooks.account_usage(tmp_path) == [{"id": "plan"}]
+    monkeypatch.setattr(hooks, "account_env", lambda d: {"CURSOR_API_KEY": "key-b"})
+    assert hooks.account_usage(tmp_path) == [{"id": "plan"}]
+    assert seen == [("", {"session": "jwt-token"}), ("key-b", {"session": ""})]
+
+
 def test_limit_errors(monkeypatch):
     a = load_adapter(monkeypatch)
     assert a.is_limit_error("You've hit your usage limit for Composer")
