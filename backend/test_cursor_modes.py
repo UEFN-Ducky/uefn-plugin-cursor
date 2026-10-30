@@ -21,11 +21,9 @@ def load_adapter(monkeypatch, name="_cursor_modes"):
     package = types.ModuleType(name)
     package.__path__ = [str(ROOT / "backend")]
     monkeypatch.setitem(sys.modules, name, package)
-    spec = importlib.util.spec_from_file_location(name + ".cursor_adapter", ROOT / "backend/cursor_adapter.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
+    for sub in [m for m in sys.modules if m.startswith(name + ".")]:
+        monkeypatch.delitem(sys.modules, sub)
+    return importlib.import_module(name + ".cursor_adapter")
 
 
 @pytest.fixture
@@ -480,28 +478,19 @@ def test_login_account_signs_the_chat_folder_in(launch, tmp_path):
     assert not result.ok and "API key account" in result.error
 
 
-def load_plugin(monkeypatch):
-    name = "_cursor_plugin"
-    spec = importlib.util.spec_from_file_location(
-        name, ROOT / "backend/__init__.py", submodule_search_locations=[str(ROOT / "backend")])
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_account_hooks(monkeypatch, tmp_path):
     from backend.agent import accounts
-    p = load_plugin(monkeypatch)
+    a = load_adapter(monkeypatch, "_cursor_accounts")
+    p = importlib.import_module("_cursor_accounts.cursor_accounts")
     monkeypatch.setattr(accounts, "list_accounts", lambda _p: [
         {"id": "default", "kind": "key"}, {"id": "team", "kind": "key"}, {"id": "me", "kind": "login"}])
     monkeypatch.setattr(accounts, "account_key", lambda prov, aid: f"{prov}-{aid}-key")
-    assert p._account_env(tmp_path / "team") == {"CURSOR_API_KEY": "cursor-team-key"}
-    assert p._account_env(tmp_path / "me") == {"DUCKY_CURSOR_ACCOUNT_DIR": str(tmp_path / "me")}
-    monkeypatch.setattr(sys.modules["_cursor_plugin.cursor_adapter"], "which_cli", lambda *a: "agent")
-    assert p._account_login(tmp_path / "me") == {"argv": ["agent", "login"],
-                                                 "env": {"CURSOR_CONFIG_DIR": str(tmp_path / "me")}}
-    assert p._account_login(None)["env"] == {}
+    assert p.account_env(tmp_path / "team") == {"CURSOR_API_KEY": "cursor-team-key"}
+    assert p.account_env(tmp_path / "me") == {a.ACCOUNT_DIR_ENV: str(tmp_path / "me")}
+    monkeypatch.setattr(p, "which_cli", lambda *_a: "agent")
+    assert p.account_login(tmp_path / "me") == {"argv": ["agent", "login"],
+                                                "env": {"CURSOR_CONFIG_DIR": str(tmp_path / "me")}}
+    assert p.account_login(None)["env"] == {}
     assert p.parse_status("Logged in as ana@example.com") == {"loggedIn": True, "email": "ana@example.com"}
     assert p.parse_status("Not logged in") == {"loggedIn": False}
 
