@@ -21,11 +21,9 @@ def load_adapter(monkeypatch, name="_cursor_modes"):
     package = types.ModuleType(name)
     package.__path__ = [str(ROOT / "backend")]
     monkeypatch.setitem(sys.modules, name, package)
-    spec = importlib.util.spec_from_file_location(name + ".cursor_adapter", ROOT / "backend/cursor_adapter.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-    return module
+    for sub in [m for m in sys.modules if m.startswith(name + ".")]:
+        monkeypatch.delitem(sys.modules, sub)
+    return importlib.import_module(name + ".cursor_adapter")
 
 
 @pytest.fixture
@@ -452,3 +450,120 @@ def test_project_mcp_servers_stop_at_the_home_folder(launch, monkeypatch, tmp_pa
         (folder / ".cursor" / "mcp.json").write_text(json.dumps({"mcpServers": servers}))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     assert launch.a._project_mcp_servers(str(game)) == ["unreal-mcp", "helper"]
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask"])
+def test_key_account_runs_with_its_key(launch, mode):
+    assert launch(mode=mode, env={"CURSOR_API_KEY": "team-key"}).ok
+    rec = launch.records[0]
+    assert (rec["apiKey"] if mode == "agent" else rec["env_extra"]["CURSOR_API_KEY"]) == "team-key"
+
+
+def test_default_account_keeps_saved_key(launch):
+    assert launch(mode="ask").ok
+    assert launch.records[0]["env_extra"]["CURSOR_API_KEY"] == "synthetic-key"
+
+
+def test_login_account_signs_the_chat_folder_in(launch, tmp_path):
+    login = tmp_path / "accounts" / "cursor" / "ab12"
+    login.mkdir(parents=True)
+    (login / "auth.json").write_text('{"token": "t"}')
+    env = {launch.a.ACCOUNT_DIR_ENV: str(login)}
+    assert launch(mode="ask", env=env).ok
+    cli_env = launch.records[0]["env_extra"]
+    assert cli_env["CURSOR_API_KEY"] == "" and launch.a.ACCOUNT_DIR_ENV not in cli_env
+    chat = Path(cli_env["CURSOR_CONFIG_DIR"])
+    assert (chat / "auth.json").read_text() == '{"token": "t"}' and (chat / "mcp.json").is_file()
+    result = launch(mode="agent", env=env)
+    assert not result.ok and "API key account" in result.error
+
+
+def test_account_hooks(monkeypatch, tmp_path):
+    from backend.agent import accounts
+    a = load_adapter(monkeypatch, "_cursor_accounts")
+    p = importlib.import_module("_cursor_accounts.cursor_accounts")
+    monkeypatch.setattr(accounts, "list_accounts", lambda _p: [
+        {"id": "default", "kind": "key"}, {"id": "team", "kind": "key"}, {"id": "me", "kind": "login"}])
+    monkeypatch.setattr(accounts, "account_key", lambda prov, aid: f"{prov}-{aid}-key")
+    assert p.account_env(tmp_path / "team") == {"CURSOR_API_KEY": "cursor-team-key"}
+    assert p.account_env(tmp_path / "me") == {a.ACCOUNT_DIR_ENV: str(tmp_path / "me")}
+    monkeypatch.setattr(p, "which_cli", lambda *_a: "agent")
+    assert p.account_login(tmp_path / "me") == {"argv": ["agent", "login"],
+                                                "env": {"CURSOR_CONFIG_DIR": str(tmp_path / "me")}}
+    assert p.account_login(None)["env"] == {}
+    assert p.parse_status("Logged in as ana@example.com") == {"loggedIn": True, "email": "ana@example.com"}
+    assert p.parse_status("Not logged in") == {"loggedIn": False}
+
+
+@pytest.fixture
+def two_keys(launch, monkeypatch, tmp_path):
+    from backend.agent import accounts
+    hooks = importlib.import_module("_cursor_modes.cursor_accounts")
+    monkeypatch.setattr(accounts, "_data_root", lambda: tmp_path / "data")
+    monkeypatch.setattr(accounts, "_agent_reg", lambda _id: {"account_env": hooks.account_env})
+    monkeypatch.setattr(accounts, "account_key", lambda _p, aid: f"key-{aid}")
+    monkeypatch.setattr(accounts, "_CURRENT", {})
+    return accounts
+
+
+def _limit_once(launch, monkeypatch, mode):
+    hits = []
+    def process(**kw):
+        if hits:
+            return launch.process(**kw)
+        hits.append(1)
+        if "-p" in kw["argv"]:
+            launch.records.append(kw)
+            kw["on_line"](json.dumps({"type": "result", "is_error": True, "result": "You've hit your usage limit"}))
+        else:
+            launch.records.append(json.loads(Path(kw["argv"][-1]).read_text()))
+            kw["on_line"](json.dumps({"type": "done", "status": "error", "error": {"message": "You've hit your usage limit"}}))
+        return ProcResult(returncode=1)
+    monkeypatch.setattr(launch.a, "run_streaming_process", process)
+
+
+def _keys(launch, mode):
+    return [r["apiKey"] if mode == "agent" else r["env_extra"]["CURSOR_API_KEY"] for r in launch.records]
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask"])
+def test_limit_replays_once_on_the_next_key(launch, two_keys, monkeypatch, mode):
+    b = two_keys.add_account("cursor", "B", "key")
+    env = two_keys.coding_agent_account_env("cursor")  # runner: default account → {}
+    _limit_once(launch, monkeypatch, mode)
+    result = launch(mode=mode, env=env)
+    assert result.ok, result.error
+    assert _keys(launch, mode) == ["synthetic-key", f"key-{b}"]
+    assert two_keys.exhausted_until("cursor", "default") and two_keys.current_account("cursor") == b
+    assert any("switching account" in e.get("text", "") for e in launch.events)
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask"])
+def test_limit_with_no_other_account_reports_it(launch, two_keys, monkeypatch, mode):
+    two_keys.coding_agent_account_env("cursor")
+    _limit_once(launch, monkeypatch, mode)
+    result = launch(mode=mode, env={})
+    assert not result.ok and result.error == launch.a._LIMIT_ERROR and len(launch.records) == 1
+
+
+def test_account_usage(monkeypatch, tmp_path):
+    load_adapter(monkeypatch, "_cursor_usage")
+    usage = importlib.import_module("_cursor_usage.usage")
+    hooks = importlib.import_module("_cursor_usage.cursor_accounts")
+    (tmp_path / "auth.json").write_text(json.dumps({"tokens": {"accessToken": "jwt-token"}}))
+    assert usage.account_session(tmp_path) == "jwt-token"
+    assert usage.account_session(tmp_path / "missing") == ""
+    seen = []
+    monkeypatch.setattr(usage, "fetch_usage", lambda key, **kw: seen.append((key, kw)) or {"windows": [{"id": "plan"}]})
+    monkeypatch.setattr(hooks, "account_env", lambda d: {hooks.ACCOUNT_DIR_ENV: str(d)})
+    assert hooks.account_usage(tmp_path) == [{"id": "plan"}]
+    monkeypatch.setattr(hooks, "account_env", lambda d: {"CURSOR_API_KEY": "key-b"})
+    assert hooks.account_usage(tmp_path) == [{"id": "plan"}]
+    assert seen == [("", {"session": "jwt-token"}), ("key-b", {"session": ""})]
+
+
+def test_limit_errors(monkeypatch):
+    a = load_adapter(monkeypatch)
+    assert a.is_limit_error("You've hit your usage limit for Composer")
+    assert a.is_limit_error("HTTP 429 Too Many Requests")
+    assert not a.is_limit_error("Cursor CLI run failed.")

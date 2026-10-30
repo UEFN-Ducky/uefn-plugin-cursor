@@ -113,7 +113,8 @@ def _provider_factory(api_key: str, model: str, **_kw: Any) -> Any:
 
 
 def register(api) -> None:
-    from .cursor_adapter import CursorAdapter
+    from . import cursor_accounts
+    from .cursor_adapter import CursorAdapter, is_limit_error
 
     # Models catalog (Default Model picker) — was missing; key alone never listed models.
     api.register_llm_provider(
@@ -125,6 +126,7 @@ def register(api) -> None:
         test_key=_test_key,
         key_optional=False,
         shows_thinking_effort=True,
+        is_quota_error=is_limit_error,
     )
     api.register_coding_agent(
         "cursor",
@@ -142,6 +144,12 @@ def register(api) -> None:
         # Cursor works through Ducky's tools only, so Ducky's approval modes apply to it:
         # Ducky asks before its file changes (Ask before changes) and its terminal commands.
         chat_permission_modes=("ask", "edits", "all"),
+        account_env=cursor_accounts.account_env,
+        account_login=cursor_accounts.account_login,
+        account_status=cursor_accounts.account_status,
+        account_logout=cursor_accounts.account_logout,
+        account_usage=cursor_accounts.account_usage,
+        is_limit_error=is_limit_error,
     )
     api.register_ide_hookup("cursor", label="Cursor")
     try:
