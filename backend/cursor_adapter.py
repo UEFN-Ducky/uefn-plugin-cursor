@@ -49,6 +49,35 @@ _SDK_SETUP_ERROR = (
 _SDK_RUN_ERROR = "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry."
 _SESSION_RESET = "Cursor session not found in this workspace. It cannot be resumed here; the next turn will start fresh."
 
+# A sign-in account's CLI folder, set by the plugin's account_env (key accounts set CURSOR_API_KEY).
+ACCOUNT_DIR_ENV = "DUCKY_CURSOR_ACCOUNT_DIR"
+# ponytail: files the agent CLI keeps its sign-in in, copied into the chat's config folder
+# when newer; a token the CLI refreshes there isn't copied back (sign in again if it expires).
+ACCOUNT_AUTH_FILES = ("cli-config.json", "auth.json")
+_LIMIT_RE = re.compile(
+    r"usage limit|hit your (?:usage |rate )?limit|rate[ _-]?limit|quota|too many requests|\b429\b",
+    re.IGNORECASE,
+)
+
+
+def is_limit_error(text: str) -> bool:
+    """Cursor's out-of-usage / rate-limit messages."""
+    return bool(_LIMIT_RE.search(text or ""))
+
+
+def _account_auth(env: dict[str, str] | None) -> tuple[str, str]:
+    """(api key, sign-in folder) for the account this run is for; default = the saved key."""
+    env = env or {}
+    login_dir = str(env.get(ACCOUNT_DIR_ENV) or "")
+    if login_dir:
+        return "", login_dir
+    key = str(env.get("CURSOR_API_KEY") or "")
+    if not key:
+        from backend.agent.secrets import get_key
+
+        key = get_key("cursor") or ""
+    return key, ""
+
 
 def _mode_keywords(constructor, **values):
     """Optional host fields only; **kwargs alone does not certify support."""
@@ -1610,8 +1639,7 @@ class CursorAdapter:
         if not cli:
             return CodingAgentLaunchResult(ok=False, status="error", upstream_session_id=session_id,
                 error="Cursor Ask/Plan requires the Cursor agent CLI (agent or cursor-agent).")
-        from backend.agent.secrets import get_key
-        key = get_key("cursor") or ""
+        key, login_dir = _account_auth(env)
         instruction = ("Plan only. Create the plan with Ducky's ducky_create_plan tool; do not edit project files."
                        if mode == "plan" else "Answer only. Do not edit files or create a plan.")
         full_prompt = instruction + "\n\n" + (system_prompt + "\n\n" if not session_id else "") + prompt
@@ -1645,7 +1673,12 @@ class CursorAdapter:
             config = coding_agents_tmp_dir() / ("cursor-cli-" + hashlib.sha256(conv_id.encode()).hexdigest()[:24])
             config.mkdir(parents=True, exist_ok=True)
             (config / "mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+            if login_dir:
+                # The chat's own folder keeps its mcp.json; its sign-in comes from the account.
+                from backend.agent.accounts import share_config
+                share_config(Path(login_dir), config, files=ACCOUNT_AUTH_FILES)
             cli_env = {**env, "CURSOR_CONFIG_DIR": str(config), "CURSOR_API_KEY": key}
+            cli_env.pop(ACCOUNT_DIR_ENV, None)
             _disable_project_mcps(cli, cwd, cli_env)
             before = _project_snapshot(cwd)
         except (OSError, subprocess.SubprocessError):
@@ -1701,9 +1734,15 @@ class CursorAdapter:
         preflight = _ducky_preflight(mcp_config_path, session_id, cancel)
         if isinstance(preflight, CodingAgentLaunchResult):
             return preflight
-        from backend.agent.secrets import get_key
-
-        api_key = get_key("cursor") or ""
+        api_key, login_dir = _account_auth(env)
+        if login_dir:
+            return CodingAgentLaunchResult(
+                ok=False, status="error", upstream_session_id=session_id,
+                error=(
+                    "This Cursor account is a sign-in; Agent mode needs an API key account. "
+                    "Pick a key account in the model picker, or use Ask / Plan."
+                ),
+            )
         if not api_key:
             return CodingAgentLaunchResult(
                 ok=False, status="error", upstream_session_id=session_id,

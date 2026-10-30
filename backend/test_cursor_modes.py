@@ -452,3 +452,62 @@ def test_project_mcp_servers_stop_at_the_home_folder(launch, monkeypatch, tmp_pa
         (folder / ".cursor" / "mcp.json").write_text(json.dumps({"mcpServers": servers}))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     assert launch.a._project_mcp_servers(str(game)) == ["unreal-mcp", "helper"]
+
+
+@pytest.mark.parametrize("mode", ["agent", "ask"])
+def test_key_account_runs_with_its_key(launch, mode):
+    assert launch(mode=mode, env={"CURSOR_API_KEY": "team-key"}).ok
+    rec = launch.records[0]
+    assert (rec["apiKey"] if mode == "agent" else rec["env_extra"]["CURSOR_API_KEY"]) == "team-key"
+
+
+def test_default_account_keeps_saved_key(launch):
+    assert launch(mode="ask").ok
+    assert launch.records[0]["env_extra"]["CURSOR_API_KEY"] == "synthetic-key"
+
+
+def test_login_account_signs_the_chat_folder_in(launch, tmp_path):
+    login = tmp_path / "accounts" / "cursor" / "ab12"
+    login.mkdir(parents=True)
+    (login / "auth.json").write_text('{"token": "t"}')
+    env = {launch.a.ACCOUNT_DIR_ENV: str(login)}
+    assert launch(mode="ask", env=env).ok
+    cli_env = launch.records[0]["env_extra"]
+    assert cli_env["CURSOR_API_KEY"] == "" and launch.a.ACCOUNT_DIR_ENV not in cli_env
+    chat = Path(cli_env["CURSOR_CONFIG_DIR"])
+    assert (chat / "auth.json").read_text() == '{"token": "t"}' and (chat / "mcp.json").is_file()
+    result = launch(mode="agent", env=env)
+    assert not result.ok and "API key account" in result.error
+
+
+def load_plugin(monkeypatch):
+    name = "_cursor_plugin"
+    spec = importlib.util.spec_from_file_location(
+        name, ROOT / "backend/__init__.py", submodule_search_locations=[str(ROOT / "backend")])
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_account_hooks(monkeypatch, tmp_path):
+    from backend.agent import accounts
+    p = load_plugin(monkeypatch)
+    monkeypatch.setattr(accounts, "list_accounts", lambda _p: [
+        {"id": "default", "kind": "key"}, {"id": "team", "kind": "key"}, {"id": "me", "kind": "login"}])
+    monkeypatch.setattr(accounts, "account_key", lambda prov, aid: f"{prov}-{aid}-key")
+    assert p._account_env(tmp_path / "team") == {"CURSOR_API_KEY": "cursor-team-key"}
+    assert p._account_env(tmp_path / "me") == {"DUCKY_CURSOR_ACCOUNT_DIR": str(tmp_path / "me")}
+    monkeypatch.setattr(sys.modules["_cursor_plugin.cursor_adapter"], "which_cli", lambda *a: "agent")
+    assert p._account_login(tmp_path / "me") == {"argv": ["agent", "login"],
+                                                 "env": {"CURSOR_CONFIG_DIR": str(tmp_path / "me")}}
+    assert p._account_login(None)["env"] == {}
+    assert p.parse_status("Logged in as ana@example.com") == {"loggedIn": True, "email": "ana@example.com"}
+    assert p.parse_status("Not logged in") == {"loggedIn": False}
+
+
+def test_limit_errors(monkeypatch):
+    a = load_adapter(monkeypatch)
+    assert a.is_limit_error("You've hit your usage limit for Composer")
+    assert a.is_limit_error("HTTP 429 Too Many Requests")
+    assert not a.is_limit_error("Cursor CLI run failed.")

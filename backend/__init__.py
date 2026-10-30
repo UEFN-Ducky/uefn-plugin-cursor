@@ -66,6 +66,73 @@ def _normalize_model(model: str) -> str:
     return mid
 
 
+def _account_kind(config_dir: Any) -> str:
+    from backend.agent.accounts import list_accounts
+
+    aid = Path(config_dir).name  # core's account folder ends in <provider>/<id>
+    return next((a["kind"] for a in list_accounts("cursor") if a["id"] == aid), "key")
+
+
+def _account_env(config_dir: Any) -> dict[str, str]:
+    """Key account → its CURSOR_API_KEY; sign-in account → its CLI folder for the adapter."""
+    from backend.agent.accounts import account_key
+
+    from .cursor_adapter import ACCOUNT_DIR_ENV
+
+    if _account_kind(config_dir) == "login":
+        return {ACCOUNT_DIR_ENV: str(config_dir)}
+    return {"CURSOR_API_KEY": account_key("cursor", Path(config_dir).name) or ""}
+
+
+def _agent_cli() -> str:
+    from .cursor_adapter import which_cli
+
+    cli = which_cli("agent", "") or which_cli("cursor-agent", "")
+    if not cli:
+        raise ValueError("Cursor sign-in needs the Cursor agent CLI (agent or cursor-agent) on PATH.")
+    return cli
+
+
+def _cli_env(config_dir: Any) -> dict[str, str]:
+    return {"CURSOR_CONFIG_DIR": str(config_dir)} if config_dir else {}  # None = the CLI's own
+
+
+def _account_login(config_dir: Any) -> dict[str, Any]:
+    return {"argv": [_agent_cli(), "login"], "env": _cli_env(config_dir)}
+
+
+def _run_cli(config_dir: Any, *args: str) -> str:
+    import os
+    import subprocess
+
+    proc = subprocess.run([_agent_cli(), *args], env={**os.environ, **_cli_env(config_dir)},
+                          capture_output=True, text=True, timeout=30)
+    return f"{proc.stdout}\n{proc.stderr}"
+
+
+def parse_status(text: str) -> dict[str, Any]:
+    """`agent status` output → {loggedIn, email?}."""
+    import re
+
+    if re.search(r"not (?:logged|signed) in", text, re.IGNORECASE):
+        return {"loggedIn": False}
+    m = re.search(r"(?:logged|signed) in(?: as)?\s+(\S+@\S+)", text, re.IGNORECASE)
+    if m:
+        return {"loggedIn": True, "email": m.group(1).rstrip(".")}
+    return {"loggedIn": bool(re.search(r"(?:logged|signed) in", text, re.IGNORECASE))}
+
+
+def _account_status(config_dir: Any) -> dict[str, Any]:
+    try:
+        return parse_status(_run_cli(config_dir, "status"))
+    except Exception:
+        return {"loggedIn": False}
+
+
+def _account_logout(config_dir: Any) -> None:
+    _run_cli(config_dir, "logout")
+
+
 def _skills_dir() -> str:
     return str(Path.home() / ".cursor" / "skills")
 
@@ -113,7 +180,7 @@ def _provider_factory(api_key: str, model: str, **_kw: Any) -> Any:
 
 
 def register(api) -> None:
-    from .cursor_adapter import CursorAdapter
+    from .cursor_adapter import CursorAdapter, is_limit_error
 
     # Models catalog (Default Model picker) — was missing; key alone never listed models.
     api.register_llm_provider(
@@ -125,6 +192,7 @@ def register(api) -> None:
         test_key=_test_key,
         key_optional=False,
         shows_thinking_effort=True,
+        is_quota_error=is_limit_error,
     )
     api.register_coding_agent(
         "cursor",
@@ -142,6 +210,11 @@ def register(api) -> None:
         # Cursor works through Ducky's tools only, so Ducky's approval modes apply to it:
         # Ducky asks before its file changes (Ask before changes) and its terminal commands.
         chat_permission_modes=("ask", "edits", "all"),
+        account_env=_account_env,
+        account_login=_account_login,
+        account_status=_account_status,
+        account_logout=_account_logout,
+        is_limit_error=is_limit_error,
     )
     api.register_ide_hookup("cursor", label="Cursor")
     try:
