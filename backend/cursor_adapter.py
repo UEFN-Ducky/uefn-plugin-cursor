@@ -42,11 +42,20 @@ _NODE_REQUIRED = (
     "Ducky tools unavailable: install Node.js 22.13+ and npm, make both available on PATH, "
     "then retry so Ducky can set up the Cursor SDK."
 )
+# "was not found" maps to usage_events.kind_of not_found, so analytics isn't "other".
 _SDK_SETUP_ERROR = (
-    "Ducky tools unavailable: Cursor SDK setup failed. Ensure Node.js 22.13+ and npm are on PATH "
+    "Ducky tools unavailable: the Cursor SDK was not found and could not be set up. "
+    "Ensure Node.js 22.13+ and npm are on PATH "
     "and npm can access the package registry, then retry so Ducky can set up the SDK."
 )
 _SDK_RUN_ERROR = "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry."
+_NO_MODEL_ERROR = (
+    "No Cursor model selected. Pick Auto or a concrete model "
+    "(e.g. Composer 2.5) for this chat or Ducky profile."
+)
+_AUTH_ERROR = "Cursor rejected the API key (401 unauthorized). Update the Cursor API key in Settings, then retry."
+_AUTH_SIGNAL = "CURSOR_AUTH_FAILED"
+_AUTH_RE = re.compile(r"\b401\b|unauthori[sz]ed|invalid api key|authentication failed", re.IGNORECASE)
 _SESSION_RESET = "Cursor session not found in this workspace. It cannot be resumed here; the next turn will start fresh."
 
 # A sign-in account's CLI folder, set by the plugin's account_env (key accounts set CURSOR_API_KEY).
@@ -309,6 +318,16 @@ function toolResultText(tc) {
   }
 }
 
+// A rejected key exits 4 with a fixed signal; the SDK's own text stays private.
+function exitIfAuth(e) {
+  const status = e && (e.status ?? e.statusCode ?? (e.response && e.response.status));
+  const text = String((e && e.name) || "") + " " + String((e && e.message) || "");
+  if (status === 401 || /\b401\b|unauthori[sz]ed|invalid api key|authentication failed/i.test(text)) {
+    console.error("CURSOR_AUTH_FAILED");
+    process.exit(4);
+  }
+}
+
 async function loadSdk() {
   try {
     return await import("@cursor/sdk");
@@ -357,6 +376,7 @@ async function main() {
         process.exit(1);
       }
       reportDuckyFailure(e);
+      exitIfAuth(e);
       // Missing under this workspace is not proof of expiry. Never replay a
       // resumed task in a new agent, nor classify failures from message text.
       const missing = typeof sdk.AgentNotFoundError === "function" &&
@@ -554,6 +574,7 @@ main().catch((e) => {
     process.exit(1);
   }
   reportDuckyFailure(e);
+  exitIfAuth(e);
   console.error("Cursor SDK request failed. Check SDK connectivity and configuration.");
   process.exit(1);
 });
@@ -631,6 +652,7 @@ class _CursorStreamState:
         self.ducky_connection_failed = False
         self.error_text = ""
         self.limit_hit = False
+        self.auth_failed = False
         self.saw_json = False
         self.usage: dict[str, Any] = {}
         # Last per-step window from intermediate usage events; done.usage may be
@@ -968,6 +990,7 @@ class _CursorStreamState:
             self.is_error = True
             self.error_text = _SDK_RUN_ERROR
             self.limit_hit = is_limit_error(str(err["message"]))
+            self.auth_failed = bool(_AUTH_RE.search(str(err["message"])))
         elif self._done_status and self._done_status not in ("finished", "done", "success"):
             self.is_error = True
             self.error_text = _SDK_RUN_ERROR
@@ -1575,6 +1598,12 @@ class CursorAdapter:
 
         # Partial answer/tool output is retained below, but never makes a
         # failed process successful. Cancellation/timeout/reset take precedence.
+        if state.auth_failed or (proc.returncode == 4 and err_tail.strip() == _AUTH_SIGNAL):
+            return CodingAgentLaunchResult(
+                ok=False, status="needs_login", upstream_session_id=new_session, error=_AUTH_ERROR,
+                reply_text=reply, streamed=bool(streamed) or bool(blocks), blocks=blocks,
+            )
+
         if state.is_error or proc.returncode != 0:
             err = _LIMIT_ERROR if state.limit_hit or is_limit_error(err_tail) else _SDK_RUN_ERROR
             # Preserve the handle on errors. Text such as "not found" may refer
@@ -1770,7 +1799,7 @@ class CursorAdapter:
         api_key, login_dir = _account_auth(env)
         if login_dir:
             return CodingAgentLaunchResult(
-                ok=False, status="error", upstream_session_id=session_id,
+                ok=False, status="needs_login", upstream_session_id=session_id,
                 error=(
                     "This Cursor account is a sign-in; Agent mode needs an API key account. "
                     "Pick a key account in the model picker, or use Ask / Plan."
@@ -1778,7 +1807,7 @@ class CursorAdapter:
             )
         if not api_key:
             return CodingAgentLaunchResult(
-                ok=False, status="error", upstream_session_id=session_id,
+                ok=False, status="needs_login", upstream_session_id=session_id,
                 error=(
                     "Ducky tools unavailable: configure a Cursor API key in Settings to use the SDK. "
                     "The terminal route cannot preserve Ducky MCP configuration and session."
@@ -1814,10 +1843,7 @@ class CursorAdapter:
         if not model_id:
             return CodingAgentLaunchResult(
                 ok=False,
-                error=(
-                    "No Cursor model selected. Pick Auto or a concrete model "
-                    "(e.g. Composer 2.5) for this chat or Ducky profile."
-                ),
+                error=_NO_MODEL_ERROR,
                 status="error",
                 upstream_session_id=session_id,
             )

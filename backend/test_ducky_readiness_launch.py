@@ -619,3 +619,71 @@ export const Agent={async create(o){seen("create",o);return agent},async resume(
     traces = [json.loads(line) for line in result.stdout.splitlines() if json.loads(line).get("type") == "trace"]
     assert [t["name"] for t in traces] == (["resume"] if agent_id else ["create"])
     assert traces[0]["tools"] == ["mcp"]
+
+
+def _kind(message):
+    from frontend.usage_events import kind_of
+    return kind_of(message)
+
+
+@pytest.mark.parametrize("auth", [("", "C:/signin-account"), ("", "")])
+def test_signin_or_no_key_needs_login(tmp_path, monkeypatch, launch, auth):
+    monkeypatch.setattr(adapter, "_account_auth", lambda env: auth)
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps(VALID))
+    result = launch(str(path), "s", public=True)
+    assert (result.ok, result.status, result.upstream_session_id) == (False, "needs_login", "s")
+    assert ("sign-in" if auth[1] else "API key") in result.error
+
+
+def test_no_model_error_is_not_bad_request(tmp_path, monkeypatch, launch):
+    from frontend.ui_web import conversation_attachments
+    monkeypatch.setattr(conversation_attachments, "chat_attachments_dir", lambda *a, **k: None)
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps(VALID))
+    result = launch(str(path), public=True, model="")
+    assert result.status == "error" and result.error.startswith("No Cursor model selected.")
+    assert _kind(adapter._NO_MODEL_ERROR) != "bad_request"
+
+
+def test_sdk_setup_error_has_mapped_kind(native_launch, monkeypatch):
+    monkeypatch.setattr(adapter, "_cursor_sdk_sandbox", lambda: (None, False))
+    result = native_launch()
+    assert result.status == "error" and result.error.startswith("Ducky tools unavailable:")
+    assert _kind(adapter._SDK_SETUP_ERROR) == "not_found"
+
+
+@pytest.mark.parametrize("via", ["signal", "done_error"])
+def test_sdk_401_needs_login(native_launch, monkeypatch, via):
+    from backend.agent.coding_agents.proc_exec import ProcResult
+    def process(**kw):
+        if via == "signal":
+            return ProcResult(returncode=4, stderr_tail="CURSOR_AUTH_FAILED")
+        kw["on_line"](json.dumps({"type": "done", "status": "error", "error": {"message": "401 Unauthorized " + MARKER}}))
+        return ProcResult(returncode=1, stderr_tail="CURSOR_RUN_FAILED")
+    monkeypatch.setattr(adapter, "run_streaming_process", process)
+    result = native_launch("s")
+    assert (result.ok, result.status) == (False, "needs_login")
+    assert _kind(result.error) == "auth" and MARKER not in repr(result)
+
+
+@pytest.mark.parametrize("throw", ["{status:401}", "{name:'UnauthorizedError'}", "{message:'network down'}"])
+def test_runner_maps_thrown_401_to_signal(tmp_path, throw):
+    node = shutil.which("node")
+    assert node
+    package = tmp_path / "node_modules/@cursor/sdk"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text('{"type":"module","exports":"./index.js"}', encoding="utf-8")
+    (package / "index.js").write_text(
+        "export class AgentNotFoundError extends Error {}\n"
+        f"export const Agent={{async create(){{throw Object.assign(Error('{MARKER}'), {throw});}}}};\n",
+        encoding="utf-8")
+    (tmp_path / "runner.mjs").write_text(adapter._CURSOR_SDK_RUNNER, encoding="utf-8")
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(dict(cmd="prompt", model="auto", apiKey="k", cwd=str(tmp_path), prompt="hi",
+                                      mcpServers=VALID["mcpServers"], agentId="")), encoding="utf-8")
+    proc = subprocess.run([node, str(tmp_path / "runner.mjs"), str(config)], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=10)
+    auth = "network" not in throw
+    assert (proc.returncode == 4) == auth and ("CURSOR_AUTH_FAILED" in proc.stderr) == auth
+    assert MARKER not in proc.stdout + proc.stderr
