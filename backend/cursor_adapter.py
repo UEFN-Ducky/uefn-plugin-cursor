@@ -38,11 +38,12 @@ from .cursor_effort import (
 )
 from .cursor_tool_unwrap import unwrap_cursor_tool
 
+# "was not found" maps to usage_events.kind_of not_found, so analytics isn't "other"
+# (6 Cursor turns failed in 10 s as kind "other" on Nov 2 2026, setup said not_installed).
 _NODE_REQUIRED = (
-    "Ducky tools unavailable: install Node.js 22.13+ and npm, make both available on PATH, "
+    "Ducky tools unavailable: Node.js 22.13+ and npm were not found on PATH. Install both, "
     "then retry so Ducky can set up the Cursor SDK."
 )
-# "was not found" maps to usage_events.kind_of not_found, so analytics isn't "other".
 _SDK_SETUP_ERROR = (
     "Ducky tools unavailable: the Cursor SDK was not found and could not be set up. "
     "Ensure Node.js 22.13+ and npm are on PATH "

@@ -651,6 +651,7 @@ def test_sdk_setup_error_has_mapped_kind(native_launch, monkeypatch):
     result = native_launch()
     assert result.status == "error" and result.error.startswith("Ducky tools unavailable:")
     assert _kind(adapter._SDK_SETUP_ERROR) == "not_found"
+    assert _kind(adapter._NODE_REQUIRED) == "not_found"
 
 
 @pytest.mark.parametrize("via", ["signal", "done_error"])
