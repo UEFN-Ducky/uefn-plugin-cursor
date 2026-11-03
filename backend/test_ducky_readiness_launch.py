@@ -688,3 +688,52 @@ def test_runner_maps_thrown_401_to_signal(tmp_path, throw):
     auth = "network" not in throw
     assert (proc.returncode == 4) == auth and ("CURSOR_AUTH_FAILED" in proc.stderr) == auth
     assert MARKER not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("throw,reason,kind", [
+    ("{status:404, message:'Model claude-x not found " + MARKER + "'}", "model_not_found", "not_found"),
+    ("{status:400}", "bad_request", "bad_request"),
+    ("{status:503}", "server_error", "server_error"),
+    ("{code:'ENOTFOUND'}", "network", "offline"),
+    ("{name:'Weird'}", "", "other"),
+])
+def test_failed_turn_names_a_reason_never_the_text(tmp_path, native_launch, monkeypatch, throw, reason, kind):
+    """17 of 17 Cursor turns failed with one generic error (Oct 28 - Nov 2 2026)."""
+    node = shutil.which("node")
+    assert node
+    runner_dir = tmp_path / "r"
+    package = runner_dir / "node_modules/@cursor/sdk"
+    package.mkdir(parents=True)
+    (package / "package.json").write_text('{"type":"module","exports":"./index.js"}', encoding="utf-8")
+    (package / "index.js").write_text(
+        "export class AgentNotFoundError extends Error {}\n"
+        f"export const Agent={{async create(){{throw Object.assign(Error('{MARKER}'), {throw});}}}};\n",
+        encoding="utf-8")
+    (runner_dir / "runner.mjs").write_text(adapter._CURSOR_SDK_RUNNER, encoding="utf-8")
+    config = runner_dir / "config.json"
+    config.write_text(json.dumps(dict(cmd="prompt", model="claude-x", apiKey="k", cwd=str(runner_dir), prompt="hi",
+                                      mcpServers=VALID["mcpServers"], agentId="")), encoding="utf-8")
+    proc = subprocess.run([node, str(runner_dir / "runner.mjs"), str(config)], cwd=runner_dir,
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 1 and MARKER not in proc.stdout + proc.stderr
+    assert (f"CURSOR_REASON:{reason}" in proc.stderr) == bool(reason)
+
+    from backend.agent.coding_agents.proc_exec import ProcResult
+    monkeypatch.setattr(adapter, "run_streaming_process",
+                        lambda **kw: ProcResult(returncode=1, stderr_tail=proc.stderr))
+    result = native_launch("s")
+    assert result.status == "error" and MARKER not in repr(result)
+    assert _kind(result.error) == kind
+    assert (result.error == adapter._SDK_RUN_ERROR) == (not reason)
+
+
+def test_done_error_reason_reaches_the_turn(native_launch, monkeypatch):
+    from backend.agent.coding_agents.proc_exec import ProcResult
+    def process(**kw):
+        kw["on_line"](json.dumps({"type": "done", "status": "error",
+                                  "error": {"message": MARKER, "reason": "model_not_found"}}))
+        return ProcResult(returncode=1, stderr_tail="CURSOR_RUN_FAILED")
+    monkeypatch.setattr(adapter, "run_streaming_process", process)
+    result = native_launch("s")
+    assert "model was not found" in result.error and _kind(result.error) == "not_found"
+    assert MARKER not in repr(result)

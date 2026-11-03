@@ -50,6 +50,33 @@ _SDK_SETUP_ERROR = (
     "and npm can access the package registry, then retry so Ducky can set up the SDK."
 )
 _SDK_RUN_ERROR = "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry."
+# The SDK's own error text never leaves (it can carry keys and paths), so every failed turn
+# read the same and analytics said kind "other" (17 of 17 Cursor turns, Oct 28 - Nov 2 2026).
+# The runner names one fixed reason (reasonOf: CURSOR_REASON:<word>); each phrase here
+# carries the word usage_events.kind_of reads.
+_FAILURE_REASONS = {
+    "model_not_found": "the model was not found for this account; pick Auto or another model",
+    "bad_request": "Cursor answered 400 bad request",
+    "server_error": "Cursor's server failed (500 internal server error); try again in a minute",
+    "timeout": "the request timed out",
+    "network": "network error reaching Cursor (connection refused or reset)",
+    "permission": "permission denied",
+}
+_REASON_RE = re.compile(r"CURSOR_REASON:(\w+)")
+
+
+def _failure_reason(*texts: str) -> str:
+    """The phrase for the runner's CURSOR_REASON word; '' when there is none."""
+    for text in texts:
+        found = _REASON_RE.search(text or "")
+        if found and found.group(1) in _FAILURE_REASONS:
+            return _FAILURE_REASONS[found.group(1)]
+    return ""
+
+
+def _run_error(*texts: str) -> str:
+    reason = _failure_reason(*texts)
+    return f"Cursor SDK request failed: {reason}. Check the Cursor API key in Settings, then retry." if reason else _SDK_RUN_ERROR
 _NO_MODEL_ERROR = (
     "No Cursor model selected. Pick Auto or a concrete model "
     "(e.g. Composer 2.5) for this chat or Ducky profile."
@@ -329,6 +356,25 @@ function exitIfAuth(e) {
   }
 }
 
+// One fixed word for why the SDK failed (Python turns it into a phrase); never its text.
+function reasonOf(e) {
+  if (!e) return "";
+  const status = Number(e.status ?? e.statusCode ?? (e.response && e.response.status)) || 0;
+  const text = [e.name, e.code, e.message].map((v) => String(v || "")).join(" ");
+  if (/model/i.test(text) && /not found|not available|unknown|invalid|unsupported/i.test(text)) return "model_not_found";
+  if (status === 400 || /\b400\b|bad request|invalid[_ ]request/i.test(text)) return "bad_request";
+  if (status >= 500 || /\b50[0-4]\b|internal server error|bad gateway|service unavailable/i.test(text)) return "server_error";
+  if (/timed? ?out|etimedout|deadline/i.test(text)) return "timeout";
+  if (/enotfound|econnrefused|econnreset|eai_again|getaddrinfo|fetch failed|network|socket hang up|certificate/i.test(text)) return "network";
+  if (status === 403 || /permission denied|eacces|eperm|forbidden/i.test(text)) return "permission";
+  return "";
+}
+
+function printReason(e) {
+  const reason = reasonOf(e);
+  if (reason) console.error("CURSOR_REASON:" + reason);
+}
+
 async function loadSdk() {
   try {
     return await import("@cursor/sdk");
@@ -382,6 +428,7 @@ async function main() {
       // resumed task in a new agent, nor classify failures from message text.
       const missing = typeof sdk.AgentNotFoundError === "function" &&
         e instanceof sdk.AgentNotFoundError;
+      if (!missing) printReason(e);
       console.error(missing
         ? "Cursor session not found in this workspace. It cannot be resumed here; the next turn will start fresh."
         : "Cursor session could not resume. Check SDK connectivity and authentication.");
@@ -547,7 +594,7 @@ async function main() {
     result: text,
     agentId,
     usage,
-    error: err ? { message: "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry.", code: "CURSOR_RUN_FAILED" } : null,
+    error: err ? { message: "Cursor SDK request failed. Check SDK connectivity and the Cursor API key in Settings, then retry.", code: "CURSOR_RUN_FAILED", reason: reasonOf(err) } : null,
   });
 
   try {
@@ -565,6 +612,7 @@ async function main() {
   if (status === "finished") {
     process.exit(0);
   }
+  printReason(err);
   console.error("CURSOR_RUN_FAILED");
   process.exit(1);
 }
@@ -576,6 +624,7 @@ main().catch((e) => {
   }
   reportDuckyFailure(e);
   exitIfAuth(e);
+  printReason(e);
   console.error("Cursor SDK request failed. Check SDK connectivity and configuration.");
   process.exit(1);
 });
@@ -989,7 +1038,7 @@ class _CursorStreamState:
         err = data.get("error")
         if isinstance(err, dict) and err.get("message"):
             self.is_error = True
-            self.error_text = _SDK_RUN_ERROR
+            self.error_text = _run_error(f"CURSOR_REASON:{err.get('reason') or ''}")
             self.limit_hit = is_limit_error(str(err["message"]))
             self.auth_failed = bool(_AUTH_RE.search(str(err["message"])))
         elif self._done_status and self._done_status not in ("finished", "done", "success"):
@@ -1606,7 +1655,8 @@ class CursorAdapter:
             )
 
         if state.is_error or proc.returncode != 0:
-            err = _LIMIT_ERROR if state.limit_hit or is_limit_error(err_tail) else _SDK_RUN_ERROR
+            err = (_LIMIT_ERROR if state.limit_hit or is_limit_error(err_tail)
+                   else state.error_text if state.error_text not in ("", _SDK_RUN_ERROR) else _run_error(proc.stderr_tail or ""))
             # Preserve the handle on errors. Text such as "not found" may refer
             # to a tool/config/network resource, not an expired conversation.
             return CodingAgentLaunchResult(
