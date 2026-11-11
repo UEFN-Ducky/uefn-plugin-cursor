@@ -12,7 +12,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .cursor_adapter import ACCOUNT_DIR_ENV, which_cli
+from . import cursor_login
+from .cursor_adapter import ACCOUNT_DIR_ENV, find_agent_cli
 
 
 def _kind(config_dir: Any) -> str:
@@ -32,9 +33,10 @@ def account_env(config_dir: Any) -> dict[str, str]:
 
 
 def _agent_cli() -> str:
-    cli = which_cli("agent", "") or which_cli("cursor-agent", "")
+    cli = find_agent_cli()
     if not cli:
-        raise ValueError("Cursor sign-in needs the Cursor agent CLI (agent or cursor-agent) on PATH.")
+        cursor_login.install_in_background(find_agent_cli)
+        raise ValueError(cursor_login.INSTALLING)
     return cli
 
 
@@ -43,12 +45,22 @@ def _cli_env(config_dir: Any) -> dict[str, str]:
 
 
 def account_login(config_dir: Any) -> dict[str, Any]:
+    """Terminal fallback for cores without account_browser_login."""
     return {"argv": [_agent_cli(), "login"], "env": _cli_env(config_dir)}
+
+
+def account_browser_login(config_dir: Any) -> dict[str, Any]:
+    """Settings' Log in: one click, the browser opens (installs the CLI first when missing)."""
+    try:
+        cli = _agent_cli()
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return cursor_login.start_browser_login(config_dir, cli, _cli_env(config_dir))
 
 
 def _run_cli(config_dir: Any, *args: str) -> str:
     proc = subprocess.run([_agent_cli(), *args], env={**os.environ, **_cli_env(config_dir)},
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, timeout=30, **cursor_login._hidden())
     return f"{proc.stdout}\n{proc.stderr}"
 
 
@@ -63,10 +75,14 @@ def parse_status(text: str) -> dict[str, Any]:
 
 
 def account_status(config_dir: Any) -> dict[str, Any]:
+    state = cursor_login.login_state(config_dir)
+    if state.get("pending") or not find_agent_cli():
+        return {"loggedIn": False, **state}
     try:
-        return parse_status(_run_cli(config_dir, "status"))
+        st = parse_status(_run_cli(config_dir, "status"))
     except Exception:
-        return {"loggedIn": False}
+        st = {"loggedIn": False}
+    return st if st.get("loggedIn") else {**st, **state}
 
 
 def account_logout(config_dir: Any) -> None:

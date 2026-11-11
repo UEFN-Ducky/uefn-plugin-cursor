@@ -354,7 +354,7 @@ def test_file_change_always_fails(launch, monkeypatch, mode, mutation, outcome):
 
 
 def test_missing_cli_is_actionable(launch, monkeypatch):
-    monkeypatch.setattr(launch.a, "which_cli", lambda *a: None)
+    monkeypatch.setattr(launch.a, "find_agent_cli", lambda *a: "")  # not on PATH nor in its install folder
     result = launch(mode="ask")
     assert not result.ok and "agent CLI" in result.error and not launch.records
 
@@ -487,12 +487,86 @@ def test_account_hooks(monkeypatch, tmp_path):
     monkeypatch.setattr(accounts, "account_key", lambda prov, aid: f"{prov}-{aid}-key")
     assert p.account_env(tmp_path / "team") == {"CURSOR_API_KEY": "cursor-team-key"}
     assert p.account_env(tmp_path / "me") == {a.ACCOUNT_DIR_ENV: str(tmp_path / "me")}
-    monkeypatch.setattr(p, "which_cli", lambda *_a: "agent")
+    monkeypatch.setattr(p, "find_agent_cli", lambda *_a: "agent")
     assert p.account_login(tmp_path / "me") == {"argv": ["agent", "login"],
                                                 "env": {"CURSOR_CONFIG_DIR": str(tmp_path / "me")}}
     assert p.account_login(None)["env"] == {}
     assert p.parse_status("Logged in as ana@example.com") == {"loggedIn": True, "email": "ana@example.com"}
     assert p.parse_status("Not logged in") == {"loggedIn": False}
+
+
+class _FakeLogin:
+    def __init__(self, code=0, out=""):
+        import time
+
+        self.code, self.returncode, self.started = code, None, time.monotonic()
+        self.stdout = iter([out]) if out else None
+
+    def poll(self):
+        import time
+
+        if self.returncode is None and time.monotonic() - self.started > 0.2:
+            self.returncode = self.code
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+def _settle(p, folder):
+    import time
+
+    for _ in range(100):
+        if not p.cursor_login.login_state(folder).get("pending"):
+            return
+        time.sleep(0.05)
+
+
+def test_one_click_login_runs_hidden_agent_login(monkeypatch, tmp_path):
+    load_adapter(monkeypatch, "_cursor_accounts")
+    p = importlib.import_module("_cursor_accounts.cursor_accounts")
+    monkeypatch.setattr(p, "find_agent_cli", lambda *_a: "agent")
+    signed_in = []
+    monkeypatch.setattr(p, "_run_cli", lambda _d, *_a: "Logged in as ana@example.com" if signed_in else "Not logged in")
+    seen = []
+    monkeypatch.setattr(p.cursor_login.subprocess, "Popen",
+                        lambda argv, **kw: seen.append((argv, kw["env"].get("CURSOR_CONFIG_DIR"))) or _FakeLogin())
+    folder = tmp_path / "me"
+    out = p.cursor_login.start_browser_login(folder, "agent", p._cli_env(folder), poll_s=0.02,
+                                             popen=p.cursor_login.subprocess.Popen)
+    assert out == {"message": p.cursor_login.WAITING}
+    assert p.account_status(folder) == {"loggedIn": False, "pending": True}
+    _settle(p, folder)
+    signed_in.append(1)
+    assert p.account_status(folder) == {"loggedIn": True, "email": "ana@example.com"}
+    assert seen == [(["agent", "login"], str(folder))]
+    assert callable(p.account_browser_login)
+
+
+def test_one_click_login_cancelled_says_why(monkeypatch, tmp_path):
+    load_adapter(monkeypatch, "_cursor_accounts")
+    p = importlib.import_module("_cursor_accounts.cursor_accounts")
+    monkeypatch.setattr(p, "find_agent_cli", lambda *_a: "agent")
+    monkeypatch.setattr(p, "_run_cli", lambda _d, *_a: "Not logged in")
+    folder = tmp_path / "me2"
+    p.cursor_login.start_browser_login(folder, "agent", {}, poll_s=0.02,
+                                       popen=lambda *_a, **_k: _FakeLogin(1, "Error: login timed out\n"))
+    _settle(p, folder)
+    st = p.account_status(folder)
+    assert st["loggedIn"] is False and "login timed out" in st["error"]
+
+
+def test_missing_cli_installs_first(monkeypatch):
+    load_adapter(monkeypatch, "_cursor_accounts")
+    p = importlib.import_module("_cursor_accounts.cursor_accounts")
+    monkeypatch.setattr(p, "find_agent_cli", lambda *_a: "")
+    monkeypatch.setitem(p.cursor_login._INSTALL, "busy", False)
+    started = []
+    monkeypatch.setattr(p.cursor_login.threading, "Thread", lambda target, **_k: type(
+        "T", (), {"start": lambda self: started.append(target)})())
+    assert p.account_browser_login(None) == {"error": p.cursor_login.INSTALLING}
+    assert p.account_status(None) == {"loggedIn": False, "pending": True, "installing": True}
+    assert len(started) == 1
 
 
 @pytest.fixture

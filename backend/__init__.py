@@ -146,6 +146,7 @@ def register(api) -> None:
         chat_permission_modes=("ask", "edits", "all"),
         account_env=cursor_accounts.account_env,
         account_login=cursor_accounts.account_login,
+        account_browser_login=cursor_accounts.account_browser_login,
         account_status=cursor_accounts.account_status,
         account_logout=cursor_accounts.account_logout,
         account_usage=cursor_accounts.account_usage,

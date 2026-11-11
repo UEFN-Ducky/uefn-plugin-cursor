@@ -98,6 +98,18 @@ _LIMIT_RE = re.compile(
 )
 
 
+def find_agent_cli(override: str = "") -> str:
+    """The Cursor agent CLI: PATH first, then the installer's own folder (a fresh install
+    isn't on this process's PATH until Ducky restarts)."""
+    found = which_cli("agent", override) or which_cli("cursor-agent", override)
+    if found or (override or "").strip():
+        return found
+    folder = (Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "cursor-agent"
+              if os.name == "nt" else Path.home() / ".local" / "bin")
+    names = ("agent.cmd", "cursor-agent.cmd") if os.name == "nt" else ("agent", "cursor-agent")
+    return next((str(folder / n) for n in names if (folder / n).is_file()), "")
+
+
 def is_limit_error(text: str) -> bool:
     """Cursor's out-of-usage / rate-limit messages."""
     return bool(_LIMIT_RE.search(text or ""))
@@ -1474,7 +1486,7 @@ class CursorAdapter:
         cfg = coding_agent_cfg(settings, self.id)
         enabled = bool(cfg.get("enabled", True))
         override = str(cfg.get("cli_path") or "")
-        path = which_cli("cursor-agent", override) or which_cli("agent", override)
+        path = find_agent_cli(override)
         default_args = str(cfg.get("default_args") or "")
         has_cursor_key = has_key("cursor")
         if not enabled:
@@ -1745,7 +1757,7 @@ class CursorAdapter:
         servers = _ducky_preflight(mcp_config_path, session_id, cancel)
         if isinstance(servers, CodingAgentLaunchResult):
             return servers
-        cli = which_cli("agent", cli_path) or which_cli("cursor-agent", cli_path)
+        cli = find_agent_cli(cli_path)
         if not cli:
             return CodingAgentLaunchResult(ok=False, status="error", upstream_session_id=session_id,
                 error="Cursor Ask/Plan requires the Cursor agent CLI (agent or cursor-agent).")
