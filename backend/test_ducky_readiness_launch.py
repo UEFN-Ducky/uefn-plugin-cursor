@@ -695,6 +695,10 @@ def test_runner_maps_thrown_401_to_signal(tmp_path, throw):
     ("{status:400}", "bad_request", "bad_request"),
     ("{status:503}", "server_error", "server_error"),
     ("{code:'ENOTFOUND'}", "network", "offline"),
+    # Nov 11 2026: 35 turns failed within 10 s and all read "other".
+    ("{status:402, message:'Upgrade your plan " + MARKER + "'}", "plan", "other"),
+    ("{status:429}", "rate_limit", "rate_limit"),
+    ("{status:409}", "http_409", "other"),
     ("{name:'Weird'}", "", "other"),
 ])
 def test_failed_turn_names_a_reason_never_the_text(tmp_path, native_launch, monkeypatch, throw, reason, kind):

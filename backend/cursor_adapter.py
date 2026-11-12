@@ -61,8 +61,14 @@ _FAILURE_REASONS = {
     "timeout": "the request timed out",
     "network": "network error reaching Cursor (connection refused or reset)",
     "permission": "permission denied",
+    # Nov 11 2026: 35 Cursor turns failed within 10 s and all read "other": none of the words
+    # above fitted. A plan without that model or with no usage left, a rate limit, and any
+    # other HTTP answer now carry their own word too (http_<status> for the rest).
+    "plan": "this Cursor plan does not include that model or has no usage left (402 payment required)",
+    "rate_limit": "Cursor's rate or usage limit was hit (429 rate limit); try again in a minute",
 }
 _REASON_RE = re.compile(r"CURSOR_REASON:(\w+)")
+_HTTP_REASON_RE = re.compile(r"http_([1-5]\d\d)$")
 
 
 def _failure_reason(*texts: str) -> str:
@@ -71,6 +77,9 @@ def _failure_reason(*texts: str) -> str:
         found = _REASON_RE.search(text or "")
         if found and found.group(1) in _FAILURE_REASONS:
             return _FAILURE_REASONS[found.group(1)]
+        status = _HTTP_REASON_RE.match(found.group(1)) if found else None
+        if status:
+            return f"Cursor answered HTTP {status.group(1)}"
     return ""
 
 
@@ -379,6 +388,10 @@ function reasonOf(e) {
   if (/timed? ?out|etimedout|deadline/i.test(text)) return "timeout";
   if (/enotfound|econnrefused|econnreset|eai_again|getaddrinfo|fetch failed|network|socket hang up|certificate/i.test(text)) return "network";
   if (status === 403 || /permission denied|eacces|eperm|forbidden/i.test(text)) return "permission";
+  if (status === 402 || /payment required|upgrade (your|to)|paid plan|not included in your plan/i.test(text)) return "plan";
+  if (status === 429 || /rate.?limit|too many requests|quota|resource[_ ]exhausted/i.test(text)) return "rate_limit";
+  // Any other HTTP answer: its status is a number, never the SDK's text.
+  if (status >= 400 && status <= 599) return "http_" + status;
   return "";
 }
 
